@@ -15,7 +15,9 @@ DEVELOPER_TOKEN = "D4yv61IQ8R0JaE5dxrd1Uw"
 CLIENT_ID       = "167266694231-g7hvta57r99etbp3sos3jfi7q7h4ef44.apps.googleusercontent.com"
 CLIENT_SECRET   = "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"
 
+# Configure logging
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s")
+
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
@@ -25,6 +27,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ───────── Helpers for Google Ads ─────────
 async def get_access_token(refresh_token: str) -> str:
     creds = Credentials(
         token=None,
@@ -75,7 +78,7 @@ async def google_ads_list_active(refresh_token: str):
             logging.debug(f"[google_ads_search] {resp.status} {text}")
             if resp.status != 200:
                 raise HTTPException(resp.status, f"Google Ads search error: {text}")
-            data = json.loads(text).get("results", [])
+            results = json.loads(text).get("results", [])
     return [
         {
             "id":           r["campaign"]["id"],
@@ -84,9 +87,10 @@ async def google_ads_list_active(refresh_token: str):
             "impressions":  int(r["metrics"]["impressions"]),
             "clicks":       int(r["metrics"]["clicks"]),
         }
-        for r in data
+        for r in results
     ]
 
+# ───────── Helpers for Meta Ads ─────────
 async def meta_ads_list_active(account_id: str, access_token: str):
     url = f"https://graph.facebook.com/v16.0/act_{account_id}/campaigns"
     filtering = json.dumps([{"field":"effective_status","operator":"IN","value":["ACTIVE"]}])
@@ -98,8 +102,12 @@ async def meta_ads_list_active(account_id: str, access_token: str):
             if resp.status != 200:
                 raise HTTPException(resp.status, f"Meta Ads error: {text}")
             data = json.loads(text).get("data", [])
-    return [{"id":c["id"],"name":c["name"],"status":c["status"]} for c in data]
+    return [
+        {"id": c["id"], "name": c["name"], "status": c["status"]}
+        for c in data
+    ]
 
+# ───────── GET Endpoints for CSV download ─────────
 @app.get("/export_google_active_campaigns_csv")
 async def export_google_active_campaigns_csv(
     google_refresh_token: str = Query(..., alias="google_refresh_token")
@@ -107,8 +115,12 @@ async def export_google_active_campaigns_csv(
     rows = await google_ads_list_active(google_refresh_token)
     buf = io.StringIO()
     writer = csv.DictWriter(buf, fieldnames=["id","name","status","impressions","clicks"])
-    writer.writeheader(); writer.writerows(rows); buf.seek(0)
-    return StreamingResponse(buf, media_type="text/csv",
+    writer.writeheader()
+    writer.writerows(rows)
+    buf.seek(0)
+    return StreamingResponse(
+        buf,
+        media_type="text/csv",
         headers={"Content-Disposition":"attachment; filename=google_active_campaigns.csv"}
     )
 
@@ -120,8 +132,12 @@ async def export_meta_active_campaigns_csv(
     rows = await meta_ads_list_active(meta_account_id, meta_access_token)
     buf = io.StringIO()
     writer = csv.DictWriter(buf, fieldnames=["id","name","status"])
-    writer.writeheader(); writer.writerows(rows); buf.seek(0)
-    return StreamingResponse(buf, media_type="text/csv",
+    writer.writeheader()
+    writer.writerows(rows)
+    buf.seek(0)
+    return StreamingResponse(
+        buf,
+        media_type="text/csv",
         headers={"Content-Disposition":"attachment; filename=meta_active_campaigns.csv"}
     )
 
@@ -138,23 +154,30 @@ async def export_combined_active_campaigns_csv(
     total_campaigns = len(all_rows)
     total_impr      = sum(r["impressions"] for r in all_rows)
     total_clicks    = sum(r["clicks"]      for r in all_rows)
-    ctr             = (total_clicks/total_impr*100) if total_impr>0 else 0.0
+    ctr             = (total_clicks / total_impr * 100) if total_impr > 0 else 0.0
 
-    buf = io.StringIO(); writer = csv.writer(buf)
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    # Aggregated header
     writer.writerow(["Metric","Value"])
     writer.writerow(["Active Campaigns", total_campaigns])
     writer.writerow(["Total Impressions", total_impr])
     writer.writerow(["Total Clicks", total_clicks])
     writer.writerow(["CTR (%)", f"{ctr:.2f}"])
     writer.writerow([])
+    # Detail rows
     header = ["id","name","status","impressions","clicks"]
     writer.writerow(header)
-    for r in all_rows: writer.writerow([r[h] for h in header])
+    for row in all_rows:
+        writer.writerow([row[h] for h in header])
     buf.seek(0)
-    return StreamingResponse(buf, media_type="text/csv",
+    return StreamingResponse(
+        buf,
+        media_type="text/csv",
         headers={"Content-Disposition":"attachment; filename=combined_active_campaigns.csv"}
     )
 
+# ───────── POST Endpoints to return JSON URL for download ─────────
 @app.post("/get_google_active_campaigns_url")
 async def get_google_active_campaigns_url(
     request: Request,
@@ -164,9 +187,8 @@ async def get_google_active_campaigns_url(
     token = payload.get("google_refresh_token")
     if not token:
         raise HTTPException(400, "google_refresh_token is required")
-    base = f"{request.url.scheme}://{request.url.netloc}"
-    path = request.url_for("export_google_active_campaigns_csv")
-    url = f"{base}{path}?google_refresh_token={token}"
+    endpoint = request.url_for("export_google_active_campaigns_csv")
+    url = f"{endpoint}?google_refresh_token={token}"
     logging.info(f"[get_google_url] Returning URL: {url}")
     return {"url": url}
 
@@ -179,10 +201,8 @@ async def get_meta_active_campaigns_url(
     aid = payload.get("meta_account_id"); tok = payload.get("meta_access_token")
     if not aid or not tok:
         raise HTTPException(400, "meta_account_id and meta_access_token are required")
-    base = f"{request.url.scheme}://{request.url.netloc}"
-    # corrected function name for path lookup:
-    path = request.url_for("export_meta_active_campaigns_csv")
-    url = f"{base}{path}?meta_account_id={aid}&meta_access_token={tok}"
+    endpoint = request.url_for("export_meta_active_campaigns_csv")
+    url = f"{endpoint}?meta_account_id={aid}&meta_access_token={tok}"
     logging.info(f"[get_meta_url] Returning URL: {url}")
     return {"url": url}
 
@@ -197,10 +217,9 @@ async def get_combined_active_campaigns_url(
     mat  = payload.get("meta_access_token")
     if not grt or not maid or not mat:
         raise HTTPException(400, "google_refresh_token, meta_account_id and meta_access_token are required")
-    base = f"{request.url.scheme}://{request.url.netloc}"
-    path = request.url_for("export_combined_active_campaigns_csv")
+    endpoint = request.url_for("export_combined_active_campaigns_csv")
     qs = f"?google_refresh_token={grt}&meta_account_id={maid}&meta_access_token={mat}"
-    url = f"{base}{path}{qs}"
+    url = f"{endpoint}{qs}"
     logging.info(f"[get_combined_url] Returning URL: {url}")
     return {"url": url}
 
