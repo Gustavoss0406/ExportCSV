@@ -169,8 +169,8 @@ async def meta_ads_list(refresh_token: str, account_id: str, with_trends: bool =
             "Impressions": imp,
             "Clicks":      clk,
             "Spend":       round(spd, 2),
-            "CTR (%)":     round(clk / max(imp,1) * 100,2),
-            "CPC":         round(spd / max(clk,1),2)
+            "CTR (%)":     round(clk / max(imp,1) * 100, 2),
+            "CPC":         round(spd / max(clk,1), 2)
         })
     df = pd.DataFrame(rows)
 
@@ -209,26 +209,39 @@ def make_xlsx(df: pd.DataFrame, trends: pd.DataFrame) -> bytes:
         val_font    = Font(bold=True, size=14, color="FFFFFF")
         align       = Alignment(horizontal="center", vertical="center")
 
-        # 1) KPIs with hyperlinks to charts
+        # 1) KPI cards with clickable links
         kpis = {
             "Active Campaigns": len(df),
             "Impressions":      int(df["Impressions"].sum()),
             "Clicks":           int(df["Clicks"].sum()),
             "Spend":            round(df["Spend"].sum(),2)
         }
-        chart_rows = {"Active Campaigns": 20, "Impressions": 20, "Clicks": 35, "Spend": 50}
+        # chart positions for each metric
+        positions = {
+            "Active Campaigns": ("F20", None),
+            "Impressions":      ("F35", ("A", 8 + len(df))),
+            "Clicks":           ("F50", ("A", 8 + len(df) + len(trends) + 2)),
+            "Spend":            ("F65", ("A", 8 + len(df) + len(trends) * 2 + 4))
+        }
         col = 1
         for title, value in kpis.items():
+            # title
             ws.merge_cells(1, col, 1, col+1)
             c1 = ws.cell(1, col, title)
             c1.font  = header_font; c1.fill = PatternFill("solid", fgColor=primary); c1.alignment = align
+            # value
             ws.merge_cells(2, col, 2, col+1)
             c2 = ws.cell(2, col)
-            c2.value = f'=HYPERLINK("#Report!A{chart_rows[title]}", "{value}")'
+            link_cell = positions[title][1]
+            if link_cell:
+                link = f"'{sheet}'!{link_cell[0]}{link_cell[1]}"
+                c2.value = f'=HYPERLINK("{link}", "{value}")'
+            else:
+                c2.value = value
             c2.font  = val_font; c2.fill = PatternFill("solid", fgColor=secondary); c2.alignment = align
             col += 2
 
-        # 2) Data table header style
+        # 2) Data table header
         for idx, col_name in enumerate(df.columns, start=1):
             cell = ws.cell(6, idx, col_name)
             cell.font = header_font
@@ -243,30 +256,37 @@ def make_xlsx(df: pd.DataFrame, trends: pd.DataFrame) -> bytes:
         table.tableStyleInfo = TableStyleInfo("TableStyleLight9", showRowStripes=True)
         ws.add_table(table)
 
-        # 3) Trends and Spend charts in same sheet
+        # 3) Multiple charts inline
         if trends is not None:
             start = 8 + max_row
+            # write trends data
             for i, (_, row) in enumerate(trends.iterrows(), start=0):
                 ws.cell(start+i, 1, row["Date"])
                 ws.cell(start+i, 2, row["Impressions"])
                 ws.cell(start+i, 3, row["Clicks"])
                 ws.cell(start+i, 4, row["Spend"])
-            chart1 = LineChart()
-            chart1.title = "Impressions & Clicks (7d)"
-            chart1.x_axis.title = "Date"; chart1.y_axis.title = "Count"
-            data_ref = Reference(ws, 2, start, 3, start+len(trends)-1)
-            cats_ref = Reference(ws, 1, start+1, start+len(trends)-1)
-            chart1.add_data(data_ref, titles_from_data=True)
-            chart1.set_categories(cats_ref)
-            ws.add_chart(chart1, "F20")
-
-            chart2 = LineChart()
-            chart2.title = "Spend (7d)"
-            chart2.x_axis.title = "Date"; chart2.y_axis.title = "USD"
-            data_ref2 = Reference(ws, 4, start, 4, start+len(trends)-1)
-            chart2.add_data(data_ref2, titles_from_data=False)
-            chart2.set_categories(cats_ref)
-            ws.add_chart(chart2, "F35")
+            # Impressions + Clicks chart
+            cht1 = LineChart()
+            cht1.title = "Impr. & Clicks (7d)"
+            ref_data = Reference(ws, 2, start, 3, start+len(trends)-1)
+            ref_cat  = Reference(ws, 1, start+1, start+len(trends)-1)
+            cht1.add_data(ref_data, titles_from_data=True)
+            cht1.set_categories(ref_cat)
+            ws.add_chart(cht1, positions["Impressions"][0])
+            # Clicks only chart
+            cht2 = LineChart()
+            cht2.title = "Clicks (7d)"
+            ref_clicks = Reference(ws, 3, start, 3, start+len(trends)-1)
+            cht2.add_data(ref_clicks, titles_from_data=False)
+            cht2.set_categories(ref_cat)
+            ws.add_chart(cht2, positions["Clicks"][0])
+            # Spend chart
+            cht3 = LineChart()
+            cht3.title = "Spend (7d)"
+            ref_spend = Reference(ws, 4, start, 4, start+len(trends)-1)
+            cht3.add_data(ref_spend, titles_from_data=False)
+            cht3.set_categories(ref_cat)
+            ws.add_chart(cht3, positions["Spend"][0])
 
     return buf.getvalue()
 
@@ -317,6 +337,6 @@ async def export_combined_xlsx(
     })
 
 if __name__ == "__main__":
-    logging.info("Starting export service on port 8080")
+    logging.info("Starting export on port 8080")
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8080, reload=True)
