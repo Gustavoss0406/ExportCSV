@@ -3,8 +3,8 @@ import json
 import csv
 import io
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import JSONResponse 
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 import aiohttp
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request as GoogleRequest
@@ -15,6 +15,7 @@ DEVELOPER_TOKEN = "D4yv61IQ8R0JaE5dxrd1Uw"
 CLIENT_ID       = "167266694231-g7hvta57r99etbp3sos3jfi7q7h4ef44.apps.googleusercontent.com"
 CLIENT_SECRET   = "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"
 
+# Configure logging
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s")
 
 app = FastAPI()
@@ -112,45 +113,42 @@ async def meta_ads_list_active(account_id: str, access_token: str):
 async def export_google_active_campaigns_csv(
     google_refresh_token: str = Query(..., alias="google_refresh_token")
 ):
-    # 1) Busca dados via helper
     rows = await google_ads_list_active(google_refresh_token)
 
-    # 2) Gera o CSV em memória
     buf = io.StringIO()
     writer = csv.DictWriter(buf, fieldnames=["id","name","status","impressions","clicks"])
     writer.writeheader()
     writer.writerows(rows)
     csv_bytes = buf.getvalue().encode("utf-8")
 
-    # 3) Prepara o payload JSON com lista de bytes
     resp = {
         "fileName": "google_active_campaigns.csv",
         "mimeType": "text/csv",
         "bytes": list(csv_bytes)
     }
-
-    # 4) Log completo do JSON que vamos devolver
     logging.debug(f"[export_google_active_campaigns_csv] RESPONSE JSON: {resp}")
-
-    # 5) Retorna JSON explicitamente
     return JSONResponse(content=resp)
+
 @app.get("/export_meta_active_campaigns_csv")
 async def export_meta_active_campaigns_csv(
     meta_account_id:   str = Query(..., alias="meta_account_id"),
     meta_access_token: str = Query(..., alias="meta_access_token")
 ):
     rows = await meta_ads_list_active(meta_account_id, meta_access_token)
+
     buf = io.StringIO()
     writer = csv.DictWriter(buf, fieldnames=["id","name","status"])
     writer.writeheader()
     writer.writerows(rows)
     csv_bytes = buf.getvalue().encode("utf-8")
-    logging.debug(f"[export_meta_active_campaigns_csv] bytes length: {len(csv_bytes)}")
-    return {
+
+    resp = {
         "fileName": "meta_active_campaigns.csv",
         "mimeType": "text/csv",
         "bytes": list(csv_bytes)
     }
+    logging.debug(f"[export_meta_active_campaigns_csv] RESPONSE JSON: {resp}")
+    return JSONResponse(content=resp)
 
 @app.get("/export_combined_active_campaigns_csv")
 async def export_combined_active_campaigns_csv(
@@ -178,14 +176,15 @@ async def export_combined_active_campaigns_csv(
     writer.writerow(header)
     for r in all_rows:
         writer.writerow([r.get(h, "") for h in header])
-
     csv_bytes = buf.getvalue().encode("utf-8")
-    logging.debug(f"[export_combined_active_campaigns_csv] bytes length: {len(csv_bytes)}")
-    return {
+
+    resp = {
         "fileName": "combined_active_campaigns.csv",
         "mimeType": "text/csv",
         "bytes": list(csv_bytes)
     }
+    logging.debug(f"[export_combined_active_campaigns_csv] RESPONSE JSON: {resp}")
+    return JSONResponse(content=resp)
 
 if __name__ == "__main__":
     logging.info("Starting export service on port 8080")
