@@ -113,13 +113,25 @@ async def meta_ads_list_active(account_id: str, access_token: str):
 async def export_google_active_campaigns_csv(
     google_refresh_token: str = Query(..., alias="google_refresh_token")
 ):
+    # 1) Busca dados via helper
     rows = await google_ads_list_active(google_refresh_token)
+
+    # 2) Gera o CSV em memória
     buf = io.StringIO()
     writer = csv.DictWriter(buf, fieldnames=["id","name","status","impressions","clicks"])
     writer.writeheader()
     writer.writerows(rows)
+
+    # 3) Converte para bytes e codifica em Base64
     csv_bytes = buf.getvalue().encode("utf-8")
     b64 = base64.b64encode(csv_bytes).decode("utf-8")
+
+    # 4) Log do fileBytes (ou apenas do tamanho se for muito grande)
+    logging.debug(f"[export_google_active_campaigns_csv] fileBytes length: {len(b64)}")
+    # Se quiser ver o conteúdo completo (cuidado, pode lotar o log):
+    # logging.debug(f"[export_google_active_campaigns_csv] fileBytes: {b64}")
+
+    # 5) Retorna JSON para o FlutterFlow
     return {
         "fileName": "google_active_campaigns.csv",
         "mimeType": "text/csv",
