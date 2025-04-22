@@ -32,7 +32,7 @@ app.add_middleware(
     allow_methods=["*"], allow_headers=["*"],
 )
 
-# ───────── Helpers ─────────
+# ───────── Helpers for API calls ─────────
 
 async def get_access_token(refresh_token: str) -> str:
     try:
@@ -78,18 +78,14 @@ async def google_ads_list(refresh_token: str, with_trends: bool = False):
             if resp.status != 200:
                 raise HTTPException(resp.status, f"Google search: {text}")
             results = json.loads(text).get("results", [])
-    rows = []
-    for r in results:
-        imp = int(r["metrics"]["impressions"])
-        clk = int(r["metrics"]["clicks"])
-        rows.append({
-            "Campaign ID": r["campaign"]["id"],
-            "Name":        r["campaign"]["name"],
-            "Status":      r["campaign"]["status"],
-            "Impressions": imp,
-            "Clicks":      clk,
-            "CTR (%)":     round(clk / max(imp,1) * 100,2)
-        })
+    rows = [{
+        "Campaign ID": r["campaign"]["id"],
+        "Name":        r["campaign"]["name"],
+        "Status":      r["campaign"]["status"],
+        "Impressions": int(r["metrics"]["impressions"]),
+        "Clicks":      int(r["metrics"]["clicks"]),
+        "CTR (%)":     round(int(r["metrics"]["clicks"])/max(int(r["metrics"]["impressions"]),1)*100,2)
+    } for r in results]
     df = pd.DataFrame(rows)
 
     trends = None
@@ -133,11 +129,10 @@ async def meta_ads_list(refresh_token: str, account_id: str, with_trends: bool =
 
     ins_url = f"https://graph.facebook.com/v16.0/act_{account_id}/insights"
     since = (datetime.now().date() - timedelta(days=7)).isoformat()
-    until = datetime.now().date().isoformat()
     ins_params = {
         "level":"campaign",
-        "fields":"campaign_id,impressions,clicks,spend",
-        "time_range": json.dumps({"since":since,"until":until}),
+        "fields":"campaign_id,impressions,clicks,spend,date_start",
+        "time_range": json.dumps({"since":since,"until":since}),
         "access_token": refresh_token
     }
     async with aiohttp.ClientSession() as sess:
@@ -151,28 +146,25 @@ async def meta_ads_list(refresh_token: str, account_id: str, with_trends: bool =
     rows = []
     for c in active:
         m   = map_ins.get(c["id"], {})
-        imp = int(m.get("impressions",0))
-        clk = int(m.get("clicks",0))
-        spd = float(m.get("spend",0))
         rows.append({
             "Campaign ID": c["id"],
             "Name":        c["name"],
             "Status":      c["status"],
-            "Impressions": imp,
-            "Clicks":      clk,
-            "Spend":       round(spd,2),
-            "CTR (%)":     round(clk / max(imp,1) * 100,2),
-            "CPC":         round(spd / max(clk,1),2)
+            "Impressions": int(m.get("impressions",0)),
+            "Clicks":      int(m.get("clicks",0)),
+            "Spend":       round(float(m.get("spend",0)),2),
+            "CTR (%)":     round(int(m.get("clicks",0))/max(int(m.get("impressions",1)),1)*100,2),
+            "CPC":         round(float(m.get("spend",0))/max(int(m.get("clicks",1)),1),2)
         })
     df = pd.DataFrame(rows)
 
     trends = None
     if with_trends:
         by_date = defaultdict(lambda: {"Impressions":0,"Clicks":0})
-        for d in insights:
-            dt = d.get("date_start") or d.get("date")
-            by_date[dt]["Impressions"] += int(d.get("impressions",0))
-            by_date[dt]["Clicks"]      += int(d.get("clicks",0))
+        for i in insights:
+            dt = i["date_start"]
+            by_date[dt]["Impressions"] += int(i.get("impressions",0))
+            by_date[dt]["Clicks"]      += int(i.get("clicks",0))
         dates = sorted(by_date)
         trends = pd.DataFrame({
             "Date":        dates,
@@ -182,70 +174,77 @@ async def meta_ads_list(refresh_token: str, account_id: str, with_trends: bool =
 
     return df, trends
 
-def make_xlsx(df: pd.DataFrame, trends: pd.DataFrame, sheet_name: str) -> bytes:
+def make_xlsx(df: pd.DataFrame, trends: pd.DataFrame) -> bytes:
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        sheet = "Report"
+        df.to_excel(writer, sheet_name=sheet, index=False, startrow=6)
         wb = writer.book
+        ws = writer.sheets[sheet]
 
-        # Dashboard sheet
-        ws_dash = wb.create_sheet("Dashboard", 0)
+        # Colors
+        purple = "6A0DAD"
+        pink   = "D81B60"
+        header_font = Font(bold=True, color="FFFFFF")
+        val_font    = Font(bold=True, size=14, color="FFFFFF")
+        align = Alignment(horizontal="center", vertical="center")
+
+        # 1) KPI section in same sheet
         kpis = {
             "Active Campaigns": len(df),
             "Impressions":      int(df["Impressions"].sum()),
             "Clicks":           int(df["Clicks"].sum()),
             "Avg CTR (%)":      round(df["CTR (%)"].mean(),2)
         }
-        header_font = Font(bold=True, color="FFFFFF")
-        header_fill = PatternFill("solid", fgColor="17365D")
-        val_font    = Font(bold=True, size=14, color="17365D")
-        align_center= Alignment(horizontal="center", vertical="center")
         col = 1
         for title, value in kpis.items():
-            # Title row
-            ws_dash.merge_cells(start_row=1, start_column=col, end_row=1, end_column=col+1)
-            c1 = ws_dash.cell(row=1, column=col, value=title)
-            c1.font = header_font; c1.fill = header_fill; c1.alignment = align_center
-            # Value row
-            ws_dash.merge_cells(start_row=2, start_column=col, end_row=2, end_column=col+1)
-            c2 = ws_dash.cell(row=2, column=col, value=value)
-            c2.font = val_font; c2.alignment = align_center
+            # Title cell
+            ws.merge_cells(start_row=1, start_column=col, end_row=1, end_column=col+1)
+            c1 = ws.cell(row=1, column=col, value=title)
+            c1.font  = header_font; c1.fill = PatternFill("solid", fgColor=purple); c1.alignment = align
+            # Value cell
+            ws.merge_cells(start_row=2, start_column=col, end_row=2, end_column=col+1)
+            c2 = ws.cell(row=2, column=col, value=value)
+            c2.font = val_font; c2.fill = PatternFill("solid", fgColor=pink); c2.alignment = align
             col += 2
 
-        # Data sheet
-        df.to_excel(writer, sheet_name=sheet_name, index=False, startrow=4)
-        ws = writer.sheets[sheet_name]
-        # Style header
+        # 2) Data Table header style
         for idx, col_name in enumerate(df.columns, start=1):
-            cell = ws.cell(row=5, column=idx, value=col_name)
+            cell = ws.cell(row=6, column=idx, value=col_name)
             cell.font = header_font
-            cell.fill = PatternFill("solid", fgColor="5B9BD5")
-            cell.alignment = align_center
+            cell.fill = PatternFill("solid", fgColor=pink)
+            cell.alignment = align
             ws.column_dimensions[get_column_letter(idx)].width = max(len(col_name)+2, 15)
-        ws.freeze_panes = "A6"
+
+        ws.freeze_panes = "A7"
         ws.sheet_view.showGridLines = False
-        # Excel Table
+
+        # Excel Table style
         max_row, max_col = df.shape
-        tab_ref = f"A5:{get_column_letter(max_col)}{5+max_row}"
+        tab_ref = f"A6:{get_column_letter(max_col)}{6+max_row}"
         table = Table(displayName="DataTable", ref=tab_ref)
-        style = TableStyleInfo(name="TableStyleMedium9", showRowStripes=True)
+        style = TableStyleInfo(name="TableStyleLight9", showRowStripes=True)
         table.tableStyleInfo = style
         ws.add_table(table)
 
-        # Trends sheet
+        # 3) Trends chart below table
         if trends is not None:
-            trends.to_excel(writer, sheet_name="Trends", index=False)
-            ws2 = writer.sheets["Trends"]
-            ws2.sheet_view.showGridLines = False
+            start_chart_row = 8 + max_row
+            for r_idx, date in enumerate(trends["Date"], start=start_chart_row+1):
+                ws.cell(row=r_idx, column=1, value=date)
+                ws.cell(row=r_idx, column=2, value=trends.at[r_idx-start_chart_row-1, "Impressions"])
+                ws.cell(row=r_idx, column=3, value=trends.at[r_idx-start_chart_row-1, "Clicks"])
             chart = LineChart()
-            chart.title = f"{sheet_name} Trends (7d)"
+            chart.title = "Trends (7d)"
             chart.x_axis.title = "Date"
             chart.y_axis.title = "Count"
-            max_r2, max_c2 = trends.shape
-            data_ref = Reference(ws2, min_col=2, min_row=1, max_col=3, max_row=max_r2+1)
-            cats_ref = Reference(ws2, min_col=1, min_row=2, max_row=max_r2+1)
+            data_ref = Reference(ws, min_col=2, min_row=start_chart_row+1,
+                                 max_col=3, max_row=start_chart_row+len(trends))
+            cats_ref = Reference(ws, min_col=1, min_row=start_chart_row+1,
+                                 max_row=start_chart_row+len(trends))
             chart.add_data(data_ref, titles_from_data=True)
             chart.set_categories(cats_ref)
-            ws2.add_chart(chart, "E2")
+            ws.add_chart(chart, f"E{start_chart_row}")
 
     return buf.getvalue()
 
@@ -254,7 +253,7 @@ def make_xlsx(df: pd.DataFrame, trends: pd.DataFrame, sheet_name: str) -> bytes:
 @app.get("/export_google_active_campaigns_csv")
 async def export_google_xlsx(google_refresh_token: str = Query(..., alias="google_refresh_token")):
     df, trends = await google_ads_list(google_refresh_token, with_trends=True)
-    xlsx = make_xlsx(df, trends, "Google Data")
+    xlsx = make_xlsx(df, trends)
     return JSONResponse({
         "fileName": "google_active_campaigns.xlsx",
         "mimeType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -267,7 +266,7 @@ async def export_meta_xlsx(
     meta_access_token: str = Query(..., alias="meta_access_token")
 ):
     df, trends = await meta_ads_list(meta_access_token, meta_account_id, with_trends=True)
-    xlsx = make_xlsx(df, trends, "Meta Data")
+    xlsx = make_xlsx(df, trends)
     return JSONResponse({
         "fileName": "meta_active_campaigns.xlsx",
         "mimeType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -286,8 +285,8 @@ async def export_combined_xlsx(
     tr = pd.merge(g_tr, m_tr, on="Date", how="outer", suffixes=("_G","_M")).fillna(0)
     tr["Impressions"] = tr["Impressions_G"] + tr["Impressions_M"]
     tr["Clicks"]      = tr["Clicks_G"] + tr["Clicks_M"]
-    tr = tr[["Date","Impressions","Clicks"]]
-    xlsx = make_xlsx(df, tr, "Combined Data")
+    trends = tr[["Date","Impressions","Clicks"]]
+    xlsx = make_xlsx(df, trends)
     return JSONResponse({
         "fileName": "combined_active_campaigns.xlsx",
         "mimeType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
