@@ -98,7 +98,7 @@ async def google_ads_list_active(refresh_token: str):
             "status":       r["campaign"]["status"],
             "impressions":  imp,
             "clicks":       clk,
-            "ctr (%)":      round(clk / max(imp,1) * 100, 2)
+            "ctr (%)":      round(clk / max(imp,1) * 100, 2),
         })
     return rows
 
@@ -129,11 +129,9 @@ async def google_ads_list_trends(refresh_token: str, days: int = 7):
         by_date[d]["impressions"] += int(r["metrics"]["impressions"])
         by_date[d]["clicks"]     += int(r["metrics"]["clicks"])
     dates = sorted(by_date)
-    imps  = [by_date[d]["impressions"] for d in dates]
-    clks  = [by_date[d]["clicks"] for d in dates]
-    return dates, imps, clks
+    return dates, [by_date[d]["impressions"] for d in dates], [by_date[d]["clicks"] for d in dates]
 
-# ───────── Helpers for Meta Ads ─────────
+# ───────── Helpers for Meta Ads (clamp to last 37 months) ─────────
 async def meta_ads_list_active(account_id: str, access_token: str):
     url = f"https://graph.facebook.com/v16.0/act_{account_id}/campaigns"
     params = {"fields":"id,name,status","access_token":access_token}
@@ -141,24 +139,25 @@ async def meta_ads_list_active(account_id: str, access_token: str):
         async with sess.get(url, params=params) as resp:
             text = await resp.text()
             if resp.status != 200:
-                raise HTTPException(resp.status, f"Meta Ads campaigns error: {text}")
+                raise HTTPException(resp.status, f"Meta campaigns error: {text}")
             data = json.loads(text).get("data", [])
     active = [c for c in data if c.get("status") == "ACTIVE"]
 
     ins_url = f"https://graph.facebook.com/v16.0/act_{account_id}/insights"
-    since = "2000-01-01"
+    # clamp since to 37 months ago (~1110 days)
+    since = (datetime.now().date() - timedelta(days=1110)).isoformat()
     until = datetime.now().date().isoformat()
     ins_params = {
-        "level":       "campaign",
-        "fields":      "campaign_id,impressions,clicks,spend",
-        "time_range":  json.dumps({"since": since, "until": until}),
-        "access_token":access_token
+        "level":        "campaign",
+        "fields":       "campaign_id,impressions,clicks,spend",
+        "time_range":   json.dumps({"since": since, "until": until}),
+        "access_token": access_token
     }
     async with aiohttp.ClientSession() as sess:
         async with sess.get(ins_url, params=ins_params) as resp:
             text = await resp.text()
             if resp.status != 200:
-                raise HTTPException(resp.status, f"Meta Ads insights error: {text}")
+                raise HTTPException(resp.status, f"Meta insights error: {text}")
             insights = json.loads(text).get("data", [])
 
     metrics_map = {i["campaign_id"]: i for i in insights}
@@ -167,7 +166,7 @@ async def meta_ads_list_active(account_id: str, access_token: str):
         m   = metrics_map.get(c["id"], {})
         imp = int(m.get("impressions",0))
         clk = int(m.get("clicks",0))
-        spd = float(m.get("spend",0.0))
+        spd = float(m.get("spend",0))
         rows.append({
             "id":           c["id"],
             "name":         c["name"],
@@ -182,14 +181,14 @@ async def meta_ads_list_active(account_id: str, access_token: str):
 
 async def meta_ads_list_trends(account_id: str, access_token: str, days: int = 7):
     url = f"https://graph.facebook.com/v16.0/act_{account_id}/insights"
-    since = (datetime.now().date() - timedelta(days=days)).isoformat()
+    since = (datetime.now().date() - timedelta(days=1110)).isoformat()
     until = datetime.now().date().isoformat()
     params = {
-        "level":        "campaign",
-        "fields":       "date_start,impressions,clicks",
+        "level":         "campaign",
+        "fields":        "date_start,impressions,clicks",
         "time_increment":1,
-        "time_range":   json.dumps({"since": since, "until": until}),
-        "access_token": access_token
+        "time_range":    json.dumps({"since": since, "until": until}),
+        "access_token":  access_token
     }
     async with aiohttp.ClientSession() as sess:
         async with sess.get(url, params=params) as resp:
@@ -203,36 +202,27 @@ async def meta_ads_list_trends(account_id: str, access_token: str, days: int = 7
         by_date[dt]["impressions"] += int(d["impressions"])
         by_date[dt]["clicks"]     += int(d["clicks"])
     dates = sorted(by_date)
-    imps  = [by_date[d]["impressions"] for d in dates]
-    clks  = [by_date[d]["clicks"] for d in dates]
-    return dates, imps, clks
+    return dates, [by_date[d]["impressions"] for d in dates], [by_date[d]["clicks"] for d in dates]
 
-# ───────── Fixed Combined Endpoint with Error Logging ─────────
+# ───────── Endpoints ─────────
+
 @app.get("/export_combined_active_campaigns_csv")
 async def export_combined_active_campaigns_csv(
     google_refresh_token: str = Query(..., alias="google_refresh_token"),
     meta_account_id:     str = Query(..., alias="meta_account_id"),
     meta_access_token:   str = Query(..., alias="meta_access_token")
 ):
-    # Google
-    try:
-        g_rows = await google_ads_list_active(google_refresh_token)
-        g_dates, g_imps, g_clks = await google_ads_list_trends(google_refresh_token)
-    except HTTPException as e:
-        logging.error(f"Google API error: {e.detail}")
-        raise HTTPException(e.status_code, f"Google API error: {e.detail}")
+    g_rows, (g_dates, g_imps, g_clks) = (
+        await google_ads_list_active(google_refresh_token),
+        await google_ads_list_trends(google_refresh_token)
+    )
+    m_rows, (m_dates, m_imps, m_clks) = (
+        await meta_ads_list_active(meta_account_id, meta_access_token),
+        await meta_ads_list_trends(meta_account_id, meta_access_token)
+    )
 
-    # Meta
-    try:
-        m_rows = await meta_ads_list_active(meta_account_id, meta_access_token)
-        m_dates, m_imps, m_clks = await meta_ads_list_trends(meta_account_id, meta_access_token)
-    except HTTPException as e:
-        logging.error(f"Meta API error: {e.detail}")
-        raise HTTPException(e.status_code, f"Meta API error: {e.detail}")
-
-    # Combine
     rows = g_rows + m_rows
-    dates = g_dates or m_dates
+    dates = g_dates
     combined_imps = [gi + mi for gi, mi in zip(g_imps, m_imps)]
     combined_clks = [gc + mc for gc, mc in zip(g_clks, m_clks)]
 
@@ -247,7 +237,7 @@ async def export_combined_active_campaigns_csv(
     w.writerow(["Date"] + dates)
     w.writerow(["Impressions Trend", sparkline(combined_imps)])
     w.writerow(["Clicks Trend",      sparkline(combined_clks)]); w.writerow([])
-    w.writerow(["Metric",          "Value"])
+    w.writerow(["Metric","Value"])
     w.writerow(["Google Active",   len(g_rows)])
     w.writerow(["Meta Active",     len(m_rows)])
     w.writerow(["Total Campaigns", len(rows)])
@@ -268,6 +258,7 @@ async def export_combined_active_campaigns_csv(
         "mimeType": "text/csv",
         "bytes": list(data)
     })
+
 
 if __name__ == "__main__":
     logging.info("Starting export service on port 8080")
