@@ -52,11 +52,12 @@ async def discover_customer_id(token: str) -> str:
             return names[0].split("/")[-1]
 
 async def google_ads_list(refresh_token: str, with_trends: bool = False):
-    token       = await get_access_token(refresh_token)
-    cid         = await discover_customer_id(token)
-    base_url    = f"https://googleads.googleapis.com/{API_VERSION}/customers/{cid}/googleAds:search"
-    headers     = {"Authorization": f"Bearer {token}", "developer-token": DEVELOPER_TOKEN}
-    # active campaigns
+    token    = await get_access_token(refresh_token)
+    cid      = await discover_customer_id(token)
+    base_url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{cid}/googleAds:search"
+    headers  = {"Authorization": f"Bearer {token}", "developer-token": DEVELOPER_TOKEN}
+
+    # Active campaigns
     q_active = """
         SELECT campaign.id, campaign.name, campaign.status,
                metrics.impressions, metrics.clicks
@@ -74,17 +75,19 @@ async def google_ads_list(refresh_token: str, with_trends: bool = False):
         imp = int(r["metrics"]["impressions"])
         clk = int(r["metrics"]["clicks"])
         rows.append({
-            "Campaign ID":    r["campaign"]["id"],
-            "Name":           r["campaign"]["name"],
-            "Status":         r["campaign"]["status"],
-            "Impressions":    imp,
-            "Clicks":         clk,
-            "CTR (%)":        round(clk / max(imp,1) * 100, 2)
+            "Campaign ID":   r["campaign"]["id"],
+            "Name":          r["campaign"]["name"],
+            "Status":        r["campaign"]["status"],
+            "Impressions":   imp,
+            "Clicks":        clk,
+            "CTR (%)":       round(clk / max(imp,1) * 100, 2)
         })
+    df = pd.DataFrame(rows)
 
+    # Trends
     trends = None
     if with_trends:
-        q_trend = f"""
+        q_trend = """
             SELECT segments.date, metrics.impressions, metrics.clicks
             FROM campaign
             WHERE campaign.status = 'ENABLED'
@@ -96,41 +99,42 @@ async def google_ads_list(refresh_token: str, with_trends: bool = False):
                 if resp.status != 200:
                     raise HTTPException(resp.status, text)
                 results = json.loads(text).get("results", [])
-        by_date = defaultdict(lambda: {"Impressions":0, "Clicks":0})
+        by_date = defaultdict(lambda: {"Impressions":0,"Clicks":0})
         for r in results:
             d = r["segments"]["date"]
             by_date[d]["Impressions"] += int(r["metrics"]["impressions"])
             by_date[d]["Clicks"]      += int(r["metrics"]["clicks"])
         dates = sorted(by_date)
         trends = pd.DataFrame({
-            "Date": dates,
+            "Date":        dates,
             "Impressions": [by_date[d]["Impressions"] for d in dates],
-            "Clicks":      [by_date[d]["Clicks"] for d in dates]
+            "Clicks":      [by_date[d]["Clicks"] for d in dates],
         })
-    return pd.DataFrame(rows), trends
+
+    return df, trends
 
 # ───────── Helpers for Meta Ads ─────────
 async def meta_ads_list(refresh_token: str, account_id: str, with_trends: bool = False):
-    # campaigns
-    url_campaigns = f"https://graph.facebook.com/v16.0/act_{account_id}/campaigns"
+    # Fetch campaigns
+    url_c = f"https://graph.facebook.com/v16.0/act_{account_id}/campaigns"
     params = {"fields":"id,name,status", "access_token": refresh_token}
     async with aiohttp.ClientSession() as sess:
-        async with sess.get(url_campaigns, params=params) as resp:
+        async with sess.get(url_c, params=params) as resp:
             text = await resp.text()
             if resp.status != 200:
                 raise HTTPException(resp.status, text)
             data = json.loads(text).get("data", [])
-    ids = [c["id"] for c in data if c["status"]=="ACTIVE"]
+    active_ids = [c["id"] for c in data if c["status"]=="ACTIVE"]
 
-    # insights
+    # Fetch insights
     ins_url = f"https://graph.facebook.com/v16.0/act_{account_id}/insights"
     since = (datetime.now().date() - timedelta(days=7)).isoformat()
     until = datetime.now().date().isoformat()
     ins_params = {
-        "level": "campaign",
-        "fields": "campaign_id,impressions,clicks,spend",
-        "time_range": json.dumps({"since": since, "until": until}),
-        "access_token": refresh_token
+        "level":       "campaign",
+        "fields":      "campaign_id,impressions,clicks,spend",
+        "time_range":  json.dumps({"since":since,"until":until}),
+        "access_token":refresh_token
     }
     async with aiohttp.ClientSession() as sess:
         async with sess.get(ins_url, params=ins_params) as resp:
@@ -142,11 +146,12 @@ async def meta_ads_list(refresh_token: str, account_id: str, with_trends: bool =
 
     rows = []
     for c in data:
-        if c["id"] not in ids: continue
-        m = map_ins.get(c["id"], {})
+        if c["id"] not in active_ids: 
+            continue
+        m   = map_ins.get(c["id"], {})
         imp = int(m.get("impressions",0))
         clk = int(m.get("clicks",0))
-        spd = float(m.get("spend",0))
+        spd = float(m.get("spend",0.0))
         rows.append({
             "Campaign ID": c["id"],
             "Name":        c["name"],
@@ -157,10 +162,10 @@ async def meta_ads_list(refresh_token: str, account_id: str, with_trends: bool =
             "CTR (%)":     round(clk / max(imp,1) * 100, 2),
             "CPC":         round(spd / max(clk,1), 2)
         })
+    df = pd.DataFrame(rows)
 
     trends = None
     if with_trends:
-        ins_params["time_range"] = json.dumps({"since": since, "until": until})
         async with aiohttp.ClientSession() as sess:
             async with sess.get(ins_url, params=ins_params) as resp:
                 text = await resp.text()
@@ -174,61 +179,62 @@ async def meta_ads_list(refresh_token: str, account_id: str, with_trends: bool =
             by_date[dt]["Clicks"]      += int(d["clicks"])
         dates = sorted(by_date)
         trends = pd.DataFrame({
-            "Date": dates,
+            "Date":        dates,
             "Impressions": [by_date[d]["Impressions"] for d in dates],
-            "Clicks":      [by_date[d]["Clicks"] for d in dates]
+            "Clicks":      [by_date[d]["Clicks"] for d in dates],
         })
 
-    return pd.DataFrame(rows), trends
+    return df, trends
 
-# ───────── Excel report generator ─────────
-def make_xlsx(df, trends, sheet_name):
+# ───────── Excel report generator (using openpyxl) ─────────
+def make_xlsx(df: pd.DataFrame, trends: pd.DataFrame, sheet_name: str) -> bytes:
     output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+    # use default engine (openpyxl)
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        # Data sheet
         df.to_excel(writer, sheet_name=sheet_name, index=False, startrow=4)
         wb = writer.book
         ws = writer.sheets[sheet_name]
-
-        # header format
-        fmt_hdr = wb.add_format({"bold":True, "bg_color":"#4CAF50", "font_color":"#FFFFFF"})
-        for col_num, value in enumerate(df.columns):
-            ws.write(4, col_num, value, fmt_hdr)
-            ws.set_column(col_num, col_num, max(len(value)+2, 15))
-
-        # summary at top
-        total = {
-            "Count": len(df),
-            "Impressions": int(df["Impressions"].sum()),
-            "Clicks": int(df["Clicks"].sum()),
-            "CTR (%)": round(df["CTR (%)"].mean(),2)
+        # Header format
+        fmt = wb.create_named_style(name="header")
+        fmt.font = fmt.font.copy(bold=True, color="FFFFFF")
+        fmt.fill = fmt.fill.copy(start_color="4CAF50", end_color="4CAF50", fill_type="solid")
+        for col, val in enumerate(df.columns, start=0):
+            cell = ws.cell(row=5, column=col+1)
+            cell.value = val
+            cell.style = "header"
+            ws.column_dimensions[cell.column_letter].width = max(len(val)+2, 15)
+        # Summary block
+        totals = {
+            "Count":        len(df),
+            "Impressions":  int(df["Impressions"].sum()),
+            "Clicks":       int(df["Clicks"].sum()),
+            "CTR (%) avg":  round(df["CTR (%)"].mean(),2)
         }
-        ws.write(0, 0, "Metric", fmt_hdr)
-        ws.write(0, 1, "Value", fmt_hdr)
-        for i, (k,v) in enumerate(total.items(), start=1):
-            ws.write(i, 0, k)
-            ws.write(i, 1, v)
-
-        # trend chart
+        ws.cell(row=1, column=1, value="Metric").style = "header"
+        ws.cell(row=1, column=2, value="Value").style = "header"
+        for i, (k, v) in enumerate(totals.items(), start=2):
+            ws.cell(row=i, column=1, value=k)
+            ws.cell(row=i, column=2, value=v)
+        # Trends sheet
         if trends is not None:
             trends.to_excel(writer, sheet_name="Trends", index=False)
             ws2 = writer.sheets["Trends"]
-            chart = wb.add_chart({"type":"line"})
+            chart = wb.create_chart_chart("line", title=f"{sheet_name} Trends (7d)")
             max_row = len(trends)
             chart.add_series({
                 "name":       "Impressions",
-                "categories": ["Trends", 1, 0, max_row, 0],
-                "values":     ["Trends", 1, 1, max_row, 1],
+                "categories": ["Trends", 2, 1, max_row+1, 1],
+                "values":     ["Trends", 2, 2, max_row+1, 2],
             })
             chart.add_series({
                 "name":       "Clicks",
-                "categories": ["Trends", 1, 0, max_row, 0],
-                "values":     ["Trends", 1, 2, max_row, 2],
+                "categories": ["Trends", 2, 1, max_row+1, 1],
+                "values":     ["Trends", 2, 3, max_row+1, 3],
             })
-            chart.set_title({"name": f"{sheet_name} Trends (last 7d)"})
-            chart.set_x_axis({"name": "Date"})
-            chart.set_y_axis({"name": "Count"})
-            ws2.insert_chart("E2", chart, {"x_scale":1.5, "y_scale":1.2})
-
+            chart.set_x_axis({"name":"Date"})
+            chart.set_y_axis({"name":"Count"})
+            ws2.add_chart(chart, "E2")
         writer.save()
     return output.getvalue()
 
@@ -266,12 +272,11 @@ async def export_combined_xlsx(
     g_df, g_tr = await google_ads_list(google_refresh_token, with_trends=True)
     m_df, m_tr = await meta_ads_list(meta_access_token, meta_account_id, with_trends=True)
     df = pd.concat([g_df, m_df], ignore_index=True)
-    # combine trends
-    tr = pd.merge(g_tr, m_tr, on="Date", how="outer", suffixes=("_G","_M")).fillna(0)
+    # merge trends
+    tr = pd.merge(g_tr, m_tr, on="Date", how="outer", suffixes=("_G", "_M")).fillna(0)
     tr["Impressions"] = tr["Impressions_G"] + tr["Impressions_M"]
     tr["Clicks"]      = tr["Clicks_G"] + tr["Clicks_M"]
     tr = tr[["Date","Impressions","Clicks"]]
-
     xlsx = make_xlsx(df, tr, "Combined Active")
     return JSONResponse({
         "fileName": "combined_active_campaigns.xlsx",
