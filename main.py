@@ -2,6 +2,7 @@ import logging
 import json
 import csv
 import io
+from datetime import datetime, timedelta
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -27,7 +28,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ───────── Helpers for Google Ads ─────────
+# ───────── Helpers para Google Ads ─────────
 async def get_access_token(refresh_token: str) -> str:
     creds = Credentials(
         token=None,
@@ -58,11 +59,11 @@ async def discover_customer_id(access_token: str) -> str:
             return names[0].split("/")[-1]
 
 async def google_ads_list_active(refresh_token: str):
-    access_token = await get_access_token(refresh_token)
-    customer_id  = await discover_customer_id(access_token)
-    url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{customer_id}/googleAds:search"
-    headers = {
-        "Authorization":   f"Bearer {access_token}",
+    token       = await get_access_token(refresh_token)
+    customer_id = await discover_customer_id(token)
+    url         = f"https://googleads.googleapis.com/{API_VERSION}/customers/{customer_id}/googleAds:search"
+    headers     = {
+        "Authorization":   f"Bearer {token}",
         "developer-token": DEVELOPER_TOKEN,
         "Content-Type":    "application/json"
     }
@@ -86,69 +87,213 @@ async def google_ads_list_active(refresh_token: str):
             "status":       r["campaign"]["status"],
             "impressions":  int(r["metrics"]["impressions"]),
             "clicks":       int(r["metrics"]["clicks"]),
+            "ctr (%)":      round(int(r["metrics"]["clicks"]) / max(int(r["metrics"]["impressions"]),1) * 100, 2)
         }
         for r in results
     ]
 
-# ───────── Helpers for Meta Ads ─────────
+async def google_ads_list_trends(refresh_token: str, days: int = 7):
+    token       = await get_access_token(refresh_token)
+    customer_id = await discover_customer_id(token)
+    url         = f"https://googleads.googleapis.com/{API_VERSION}/customers/{customer_id}/googleAds:search"
+    headers     = {
+        "Authorization":   f"Bearer {token}",
+        "developer-token": DEVELOPER_TOKEN,
+        "Content-Type":    "application/json"
+    }
+    query = f"""
+        SELECT campaign.id, segments.date, metrics.impressions, metrics.clicks
+        FROM campaign
+        WHERE campaign.status = 'ENABLED'
+          AND segments.date DURING LAST_{days}_DAYS
+    """
+    async with aiohttp.ClientSession() as sess:
+        async with sess.post(url, headers=headers, json={"query": query}) as resp:
+            text = await resp.text()
+            logging.debug(f"[google_ads_trends] {resp.status} {text}")
+            if resp.status != 200:
+                raise HTTPException(resp.status, f"Google Ads trends error: {text}")
+            results = json.loads(text).get("results", [])
+    trends = []
+    for r in results:
+        imp = int(r["metrics"]["impressions"])
+        clk = int(r["metrics"]["clicks"])
+        trends.append({
+            "date":        r["segments"]["date"],
+            "campaign_id": r["campaign"]["id"],
+            "impressions": imp,
+            "clicks":      clk,
+            "ctr (%)":     round(clk / max(imp,1) * 100, 2)
+        })
+    return trends
+
+# ───────── Helpers para Meta Ads ─────────
 async def meta_ads_list_active(account_id: str, access_token: str):
     url = f"https://graph.facebook.com/v16.0/act_{account_id}/campaigns"
-    filtering = json.dumps([{"field":"effective_status","operator":"IN","value":["ACTIVE"]}])
-    params = {"fields":"id,name,status","filtering":filtering,"access_token":access_token}
+    params = {
+        "fields":       "id,name,status,insights.date_preset(lifetime){impressions,clicks,spend}",
+        "filtering":    json.dumps([{"field":"effective_status","operator":"IN","value":["ACTIVE"]}]),
+        "access_token": access_token
+    }
     async with aiohttp.ClientSession() as sess:
         async with sess.get(url, params=params) as resp:
             text = await resp.text()
-            logging.debug(f"[meta_ads_campaigns] {resp.status} {text}")
+            logging.debug(f"[meta_ads_active] {resp.status} {text}")
             if resp.status != 200:
                 raise HTTPException(resp.status, f"Meta Ads error: {text}")
             data = json.loads(text).get("data", [])
-    return [
-        {"id": c["id"], "name": c["name"], "status": c["status"]}
-        for c in data
-    ]
+    rows = []
+    for c in data:
+        ins = c.get("insights", {}).get("data", [{}])[0]
+        imp = int(ins.get("impressions", 0))
+        clk = int(ins.get("clicks", 0))
+        spd = float(ins.get("spend", 0.0))
+        rows.append({
+            "id":           c["id"],
+            "name":         c["name"],
+            "status":       c["status"],
+            "impressions":  imp,
+            "clicks":       clk,
+            "spend":        round(spd, 2),
+            "ctr (%)":      round(clk / max(imp,1) * 100, 2),
+            "cpc":          round(spd / max(clk,1), 2)
+        })
+    return rows
 
-# ───────── GET Endpoints returning JSON with raw bytes ─────────
+async def meta_ads_list_trends(account_id: str, access_token: str, days: int = 7):
+    url = f"https://graph.facebook.com/v16.0/act_{account_id}/insights"
+    since = (datetime.now().date() - timedelta(days=days)).isoformat()
+    until = datetime.now().date().isoformat()
+    params = {
+        "fields":       "date_start,date_stop,impressions,clicks,spend",
+        "time_increment": 1,
+        "time_range":   json.dumps({"since": since, "until": until}),
+        "filtering":    json.dumps([{"field":"effective_status","operator":"IN","value":["ACTIVE"]}]),
+        "access_token": access_token
+    }
+    async with aiohttp.ClientSession() as sess:
+        async with sess.get(url, params=params) as resp:
+            text = await resp.text()
+            logging.debug(f"[meta_ads_trends] {resp.status} {text}")
+            if resp.status != 200:
+                raise HTTPException(resp.status, f"Meta Ads trends error: {text}")
+            data = json.loads(text).get("data", [])
+    trends = []
+    for d in data:
+        imp = int(d["impressions"])
+        clk = int(d["clicks"])
+        spd = float(d["spend"])
+        trends.append({
+            "date":        f"{d['date_start']}",
+            "impressions": imp,
+            "clicks":      clk,
+            "spend":       round(spd, 2),
+            "ctr (%)":     round(clk / max(imp,1) * 100, 2),
+            "cpc":         round(spd / max(clk,1), 2)
+        })
+    return trends
+
+# ───────── Endpoints CSV “profissa” ─────────
 
 @app.get("/export_google_active_campaigns_csv")
 async def export_google_active_campaigns_csv(
     google_refresh_token: str = Query(..., alias="google_refresh_token")
 ):
-    rows = await google_ads_list_active(google_refresh_token)
+    rows   = await google_ads_list_active(google_refresh_token)
+    trends = await google_ads_list_trends(google_refresh_token, days=7)
+
+    # 1) Header com timestamp
+    generated_at = datetime.now().isoformat()
+    summary = [
+        ["Report generated at", generated_at],
+        ["Metric",            "Value"],
+        ["Active Campaigns",  len(rows)],
+        ["Total Impressions", sum(r["impressions"] for r in rows)],
+        ["Total Clicks",      sum(r["clicks"] for r in rows)],
+        ["Average CTR (%)",   round(sum(r["clicks"] for r in rows)
+                                / max(sum(r["impressions"] for r in rows),1) * 100, 2)]
+    ]
 
     buf = io.StringIO()
-    writer = csv.DictWriter(buf, fieldnames=["id","name","status","impressions","clicks"])
-    writer.writeheader()
-    writer.writerows(rows)
-    csv_bytes = buf.getvalue().encode("utf-8")
+    writer = csv.writer(buf)
+    writer.writerows(summary)
+    writer.writerow([])
 
-    resp = {
+    # 2) Detalhamento por campanha
+    writer.writerow(["Campaign ID","Name","Status","Impressions","Clicks","CTR (%)"])
+    for r in rows:
+        writer.writerow([
+            r["id"], r["name"], r["status"],
+            r["impressions"], r["clicks"], r["ctr (%)"]
+        ])
+    writer.writerow([])
+
+    # 3) Tendências últimos 7 dias
+    writer.writerow(["Date","Campaign ID","Impressions","Clicks","CTR (%)"])
+    for t in trends:
+        writer.writerow([
+            t["date"], t["campaign_id"],
+            t["impressions"], t["clicks"], t["ctr (%)"]
+        ])
+
+    data = buf.getvalue().encode("utf-8")
+    return JSONResponse({
         "fileName": "google_active_campaigns.csv",
         "mimeType": "text/csv",
-        "bytes": list(csv_bytes)
-    }
-    logging.debug(f"[export_google_active_campaigns_csv] RESPONSE JSON: {resp}")
-    return JSONResponse(content=resp)
+        "bytes": list(data)
+    })
+
 
 @app.get("/export_meta_active_campaigns_csv")
 async def export_meta_active_campaigns_csv(
     meta_account_id:   str = Query(..., alias="meta_account_id"),
     meta_access_token: str = Query(..., alias="meta_access_token")
 ):
-    rows = await meta_ads_list_active(meta_account_id, meta_access_token)
+    rows   = await meta_ads_list_active(meta_account_id, meta_access_token)
+    trends = await meta_ads_list_trends(meta_account_id, meta_access_token, days=7)
+
+    generated_at = datetime.now().isoformat()
+    summary = [
+        ["Report generated at", generated_at],
+        ["Metric",            "Value"],
+        ["Active Campaigns",  len(rows)],
+        ["Total Impressions", sum(r["impressions"] for r in rows)],
+        ["Total Clicks",      sum(r["clicks"] for r in rows)],
+        ["Total Spend",       round(sum(r["spend"] for r in rows), 2)],
+        ["Average CTR (%)",   round(sum(r["clicks"] for r in rows)
+                                / max(sum(r["impressions"] for r in rows),1) * 100, 2)],
+        ["Average CPC",       round(sum(r["spend"] for r in rows)
+                                / max(sum(r["clicks"] for r in rows),1), 2)]
+    ]
 
     buf = io.StringIO()
-    writer = csv.DictWriter(buf, fieldnames=["id","name","status"])
-    writer.writeheader()
-    writer.writerows(rows)
-    csv_bytes = buf.getvalue().encode("utf-8")
+    writer = csv.writer(buf)
+    writer.writerows(summary)
+    writer.writerow([])
 
-    resp = {
+    writer.writerow(["Campaign ID","Name","Status","Impressions","Clicks","Spend","CTR (%)","CPC"])
+    for r in rows:
+        writer.writerow([
+            r["id"], r["name"], r["status"],
+            r["impressions"], r["clicks"], r["spend"],
+            r["ctr (%)"], r["cpc"]
+        ])
+    writer.writerow([])
+
+    writer.writerow(["Date","Impressions","Clicks","Spend","CTR (%)","CPC"])
+    for t in trends:
+        writer.writerow([
+            t["date"], t["impressions"], t["clicks"],
+            t["spend"], t["ctr (%)"], t["cpc"]
+        ])
+
+    data = buf.getvalue().encode("utf-8")
+    return JSONResponse({
         "fileName": "meta_active_campaigns.csv",
         "mimeType": "text/csv",
-        "bytes": list(csv_bytes)
-    }
-    logging.debug(f"[export_meta_active_campaigns_csv] RESPONSE JSON: {resp}")
-    return JSONResponse(content=resp)
+        "bytes": list(data)
+    })
+
 
 @app.get("/export_combined_active_campaigns_csv")
 async def export_combined_active_campaigns_csv(
@@ -156,35 +301,44 @@ async def export_combined_active_campaigns_csv(
     meta_account_id:     str = Query(..., alias="meta_account_id"),
     meta_access_token:   str = Query(..., alias="meta_access_token")
 ):
-    google_rows = await google_ads_list_active(google_refresh_token)
-    meta_rows   = await meta_ads_list_active(meta_account_id, meta_access_token)
-    all_rows    = google_rows + meta_rows
+    g_rows = await google_ads_list_active(google_refresh_token)
+    m_rows = await meta_ads_list_active(meta_account_id, meta_access_token)
+    rows   = g_rows + m_rows
+
+    generated_at = datetime.now().isoformat()
+    summary = [
+        ["Report generated at", generated_at],
+        ["Metric",               "Value"],
+        ["Google Active",        len(g_rows)],
+        ["Meta Active",          len(m_rows)],
+        ["Total Campaigns",      len(rows)],
+        ["Total Impressions",    sum(r["impressions"] for r in rows)],
+        ["Total Clicks",         sum(r["clicks"] for r in rows)],
+        ["Total Spend (Meta)",   round(sum(r.get("spend",0) for r in m_rows),2)],
+        ["Overall CTR (%)",      round(sum(r["clicks"] for r in rows)
+                                   / max(sum(r["impressions"] for r in rows),1) * 100, 2)]
+    ]
 
     buf = io.StringIO()
     writer = csv.writer(buf)
-    total_impr   = sum(r.get("impressions", 0) for r in all_rows)
-    total_clicks = sum(r.get("clicks", 0) for r in all_rows)
-    ctr = (total_clicks / total_impr * 100) if total_impr > 0 else 0.0
-
-    writer.writerow(["Metric","Value"])
-    writer.writerow(["Active Campaigns", len(all_rows)])
-    writer.writerow(["Total Impressions", total_impr])
-    writer.writerow(["Total Clicks", total_clicks])
-    writer.writerow(["CTR (%)", f"{ctr:.2f}"])
+    writer.writerows(summary)
     writer.writerow([])
-    header = ["id","name","status","impressions","clicks"]
-    writer.writerow(header)
-    for r in all_rows:
-        writer.writerow([r.get(h, "") for h in header])
-    csv_bytes = buf.getvalue().encode("utf-8")
 
-    resp = {
+    writer.writerow(["Campaign ID","Network","Name","Status","Impressions","Clicks","Spend","CTR (%)"])
+    for r in rows:
+        network = "Google" if "ctr (%)" in r and "spend" not in r else "Meta"
+        writer.writerow([
+            r["id"], network, r.get("name",""), r.get("status",""),
+            r["impressions"], r["clicks"], r.get("spend","—"), r["ctr (%)"]
+        ])
+
+    data = buf.getvalue().encode("utf-8")
+    return JSONResponse({
         "fileName": "combined_active_campaigns.csv",
         "mimeType": "text/csv",
-        "bytes": list(csv_bytes)
-    }
-    logging.debug(f"[export_combined_active_campaigns_csv] RESPONSE JSON: {resp}")
-    return JSONResponse(content=resp)
+        "bytes": list(data)
+    })
+
 
 if __name__ == "__main__":
     logging.info("Starting export service on port 8080")
