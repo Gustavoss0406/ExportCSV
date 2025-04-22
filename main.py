@@ -2,9 +2,9 @@ import logging
 import json
 import csv
 import io
-from fastapi import FastAPI, HTTPException, Body, Query, Request
+import base64
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
 import aiohttp
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request as GoogleRequest
@@ -107,7 +107,8 @@ async def meta_ads_list_active(account_id: str, access_token: str):
         for c in data
     ]
 
-# ───────── GET Endpoints for CSV download ─────────
+# ───────── GET Endpoints returning Base64 JSON ─────────
+
 @app.get("/export_google_active_campaigns_csv")
 async def export_google_active_campaigns_csv(
     google_refresh_token: str = Query(..., alias="google_refresh_token")
@@ -117,12 +118,13 @@ async def export_google_active_campaigns_csv(
     writer = csv.DictWriter(buf, fieldnames=["id","name","status","impressions","clicks"])
     writer.writeheader()
     writer.writerows(rows)
-    buf.seek(0)
-    return StreamingResponse(
-        buf,
-        media_type="text/csv",
-        headers={"Content-Disposition":"attachment; filename=google_active_campaigns.csv"}
-    )
+    csv_bytes = buf.getvalue().encode("utf-8")
+    b64 = base64.b64encode(csv_bytes).decode("utf-8")
+    return {
+        "fileName": "google_active_campaigns.csv",
+        "mimeType": "text/csv",
+        "fileBytes": b64
+    }
 
 @app.get("/export_meta_active_campaigns_csv")
 async def export_meta_active_campaigns_csv(
@@ -134,96 +136,52 @@ async def export_meta_active_campaigns_csv(
     writer = csv.DictWriter(buf, fieldnames=["id","name","status"])
     writer.writeheader()
     writer.writerows(rows)
-    buf.seek(0)
-    return StreamingResponse(
-        buf,
-        media_type="text/csv",
-        headers={"Content-Disposition":"attachment; filename=meta_active_campaigns.csv"}
-    )
+    csv_bytes = buf.getvalue().encode("utf-8")
+    b64 = base64.b64encode(csv_bytes).decode("utf-8")
+    return {
+        "fileName": "meta_active_campaigns.csv",
+        "mimeType": "text/csv",
+        "fileBytes": b64
+    }
 
 @app.get("/export_combined_active_campaigns_csv")
 async def export_combined_active_campaigns_csv(
-    google_refresh_token: str = Query(...),
-    meta_account_id:      str = Query(...),
-    meta_access_token:    str = Query(...)
+    google_refresh_token: str = Query(..., alias="google_refresh_token"),
+    meta_account_id:     str = Query(..., alias="meta_account_id"),
+    meta_access_token:   str = Query(..., alias="meta_access_token")
 ):
     google_rows = await google_ads_list_active(google_refresh_token)
     meta_rows   = await meta_ads_list_active(meta_account_id, meta_access_token)
     all_rows    = google_rows + meta_rows
 
-    total_campaigns = len(all_rows)
-    total_impr      = sum(r["impressions"] for r in all_rows)
-    total_clicks    = sum(r["clicks"]      for r in all_rows)
-    ctr             = (total_clicks / total_impr * 100) if total_impr > 0 else 0.0
-
     buf = io.StringIO()
     writer = csv.writer(buf)
-    # Aggregated header
+    # cabeçalho de métricas
+    total_impr   = sum(r.get("impressions", 0) for r in all_rows)
+    total_clicks = sum(r.get("clicks", 0) for r in all_rows)
+    ctr = (total_clicks / total_impr * 100) if total_impr > 0 else 0.0
+
     writer.writerow(["Metric","Value"])
-    writer.writerow(["Active Campaigns", total_campaigns])
+    writer.writerow(["Active Campaigns", len(all_rows)])
     writer.writerow(["Total Impressions", total_impr])
     writer.writerow(["Total Clicks", total_clicks])
     writer.writerow(["CTR (%)", f"{ctr:.2f}"])
     writer.writerow([])
-    # Detail rows
+    # linhas detalhadas
     header = ["id","name","status","impressions","clicks"]
     writer.writerow(header)
-    for row in all_rows:
-        writer.writerow([row[h] for h in header])
-    buf.seek(0)
-    return StreamingResponse(
-        buf,
-        media_type="text/csv",
-        headers={"Content-Disposition":"attachment; filename=combined_active_campaigns.csv"}
-    )
+    for r in all_rows:
+        writer.writerow([r.get(h, "") for h in header])
 
-# ───────── POST Endpoints to return JSON URL for download ─────────
-@app.post("/get_google_active_campaigns_url")
-async def get_google_active_campaigns_url(
-    request: Request,
-    payload: dict = Body(...)
-):
-    logging.debug(f"[get_google_url] Payload: {json.dumps(payload)}")
-    token = payload.get("google_refresh_token")
-    if not token:
-        raise HTTPException(400, "google_refresh_token is required")
-    endpoint = request.url_for("export_google_active_campaigns_csv")
-    url = f"{endpoint}?google_refresh_token={token}"
-    logging.info(f"[get_google_url] Returning URL: {url}")
-    return {"url": url}
-
-@app.post("/get_meta_active_campaigns_url")
-async def get_meta_active_campaigns_url(
-    request: Request,
-    payload: dict = Body(...)
-):
-    logging.debug(f"[get_meta_url] Payload: {json.dumps(payload)}")
-    aid = payload.get("meta_account_id"); tok = payload.get("meta_access_token")
-    if not aid or not tok:
-        raise HTTPException(400, "meta_account_id and meta_access_token are required")
-    endpoint = request.url_for("export_meta_active_campaigns_csv")
-    url = f"{endpoint}?meta_account_id={aid}&meta_access_token={tok}"
-    logging.info(f"[get_meta_url] Returning URL: {url}")
-    return {"url": url}
-
-@app.post("/get_combined_active_campaigns_url")
-async def get_combined_active_campaigns_url(
-    request: Request,
-    payload: dict = Body(...)
-):
-    logging.debug(f"[get_combined_url] Payload: {json.dumps(payload)}")
-    grt  = payload.get("google_refresh_token")
-    maid = payload.get("meta_account_id")
-    mat  = payload.get("meta_access_token")
-    if not grt or not maid or not mat:
-        raise HTTPException(400, "google_refresh_token, meta_account_id and meta_access_token are required")
-    endpoint = request.url_for("export_combined_active_campaigns_csv")
-    qs = f"?google_refresh_token={grt}&meta_account_id={maid}&meta_access_token={mat}"
-    url = f"{endpoint}{qs}"
-    logging.info(f"[get_combined_url] Returning URL: {url}")
-    return {"url": url}
+    csv_bytes = buf.getvalue().encode("utf-8")
+    b64 = base64.b64encode(csv_bytes).decode("utf-8")
+    return {
+        "fileName": "combined_active_campaigns.csv",
+        "mimeType": "text/csv",
+        "fileBytes": b64
+    }
 
 if __name__ == "__main__":
-    import uvicorn
     logging.info("Starting export service on port 8080")
+    import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8080, reload=True)
