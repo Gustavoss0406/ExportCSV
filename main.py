@@ -1,6 +1,5 @@
 import logging
 import json
-import csv
 import io
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -8,6 +7,7 @@ from fastapi.responses import JSONResponse
 import aiohttp
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request as GoogleRequest
+import pandas as pd
 
 # === Settings ===
 API_VERSION     = "v17"
@@ -93,8 +93,13 @@ async def google_ads_list_active(refresh_token: str):
 # ───────── Helpers for Meta Ads ─────────
 async def meta_ads_list_active(account_id: str, access_token: str):
     url = f"https://graph.facebook.com/v16.0/act_{account_id}/campaigns"
+    # incluímos insights para pegar impressões e cliques
     filtering = json.dumps([{"field":"effective_status","operator":"IN","value":["ACTIVE"]}])
-    params = {"fields":"id,name,status","filtering":filtering,"access_token":access_token}
+    params = {
+        "fields":      "id,name,status,insights.date_preset(lifetime){impressions,clicks}",
+        "filtering":   filtering,
+        "access_token": access_token
+    }
     async with aiohttp.ClientSession() as sess:
         async with sess.get(url, params=params) as resp:
             text = await resp.text()
@@ -102,31 +107,94 @@ async def meta_ads_list_active(account_id: str, access_token: str):
             if resp.status != 200:
                 raise HTTPException(resp.status, f"Meta Ads error: {text}")
             data = json.loads(text).get("data", [])
-    return [
-        {"id": c["id"], "name": c["name"], "status": c["status"]}
-        for c in data
-    ]
+    rows = []
+    for c in data:
+        insights = c.get("insights", {}).get("data", [])
+        if insights:
+            imp = int(insights[0].get("impressions", 0))
+            clk = int(insights[0].get("clicks", 0))
+        else:
+            imp = clk = 0
+        rows.append({
+            "id": c["id"],
+            "name": c["name"],
+            "status": c["status"],
+            "impressions": imp,
+            "clicks": clk
+        })
+    return rows
 
-# ───────── GET Endpoints returning JSON with raw bytes ─────────
+# ───────── Função comum para criar planilha Excel estilizada ─────────
+def create_excel_report(rows, metrics_summary=None, sheet_name='Active Campaigns'):
+    df = pd.DataFrame(rows)
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        # Dados
+        df.to_excel(writer, sheet_name=sheet_name, index=False, startrow=4)
+        workbook  = writer.book
+        worksheet = writer.sheets[sheet_name]
+
+        # Formato do cabeçalho de colunas
+        header_fmt = workbook.add_format({
+            'bold': True,
+            'font_color': '#FFFFFF',
+            'bg_color': '#4CAF50'
+        })
+        for col_num, value in enumerate(df.columns.values):
+            worksheet.write(4, col_num, value, header_fmt)
+            worksheet.set_column(col_num, col_num, max(len(value) + 2, 15))
+
+        # Sumário de métricas no topo (opcional)
+        if metrics_summary:
+            worksheet.write(0, 0, 'Metric', header_fmt)
+            worksheet.write(0, 1, 'Value', header_fmt)
+            for idx, (k, v) in enumerate(metrics_summary.items(), start=1):
+                worksheet.write(idx, 0, k)
+                worksheet.write(idx, 1, v)
+
+        # Gráfico Impressões vs. Cliques
+        chart = workbook.add_chart({'type': 'column'})
+        n = len(df)
+        # Supondo: col B = name, col D = impressions, col E = clicks
+        chart.add_series({
+            'name':       'Impressions',
+            'categories': [sheet_name, 5, 1, 5+n-1, 1],
+            'values':     [sheet_name, 5, 3, 5+n-1, 3],
+        })
+        chart.add_series({
+            'name':       'Clicks',
+            'categories': [sheet_name, 5, 1, 5+n-1, 1],
+            'values':     [sheet_name, 5, 4, 5+n-1, 4],
+        })
+        chart.set_title ({'name': f'{sheet_name} Performance'})
+        chart.set_x_axis({'name': 'Campaign'})
+        chart.set_y_axis({'name': 'Count'})
+        worksheet.insert_chart('H5', chart, {'x_scale':1.5, 'y_scale':1.5})
+
+        writer.save()
+
+    return output.getvalue()
+
+# ───────── Endpoints revisados ─────────
 
 @app.get("/export_google_active_campaigns_csv")
 async def export_google_active_campaigns_csv(
     google_refresh_token: str = Query(..., alias="google_refresh_token")
 ):
     rows = await google_ads_list_active(google_refresh_token)
-
-    buf = io.StringIO()
-    writer = csv.DictWriter(buf, fieldnames=["id","name","status","impressions","clicks"])
-    writer.writeheader()
-    writer.writerows(rows)
-    csv_bytes = buf.getvalue().encode("utf-8")
-
-    resp = {
-        "fileName": "google_active_campaigns.csv",
-        "mimeType": "text/csv",
-        "bytes": list(csv_bytes)
+    metrics = {
+        'Active Campaigns': len(rows),
+        'Total Impressions': sum(r['impressions'] for r in rows),
+        'Total Clicks':      sum(r['clicks'] for r in rows),
+        'CTR (%)':           f"{(sum(r['clicks'] for r in rows) / sum(r['impressions'] for r in rows) * 100):.2f}"
     }
-    logging.debug(f"[export_google_active_campaigns_csv] RESPONSE JSON: {resp}")
+    xlsx = create_excel_report(rows, metrics_summary=metrics, sheet_name='Google Active')
+    resp = {
+        "fileName": "google_active_campaigns.xlsx",
+        "mimeType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "bytes": list(xlsx)
+    }
+    logging.debug(f"[export_google] GENERATED XLSX {len(xlsx)} bytes")
     return JSONResponse(content=resp)
 
 @app.get("/export_meta_active_campaigns_csv")
@@ -135,19 +203,19 @@ async def export_meta_active_campaigns_csv(
     meta_access_token: str = Query(..., alias="meta_access_token")
 ):
     rows = await meta_ads_list_active(meta_account_id, meta_access_token)
-
-    buf = io.StringIO()
-    writer = csv.DictWriter(buf, fieldnames=["id","name","status"])
-    writer.writeheader()
-    writer.writerows(rows)
-    csv_bytes = buf.getvalue().encode("utf-8")
-
-    resp = {
-        "fileName": "meta_active_campaigns.csv",
-        "mimeType": "text/csv",
-        "bytes": list(csv_bytes)
+    metrics = {
+        'Active Campaigns': len(rows),
+        'Total Impressions': sum(r['impressions'] for r in rows),
+        'Total Clicks':      sum(r['clicks'] for r in rows),
+        'CTR (%)':           f"{(sum(r['clicks'] for r in rows) / sum(r['impressions'] for r in rows) * 100):.2f}"
     }
-    logging.debug(f"[export_meta_active_campaigns_csv] RESPONSE JSON: {resp}")
+    xlsx = create_excel_report(rows, metrics_summary=metrics, sheet_name='Meta Active')
+    resp = {
+        "fileName": "meta_active_campaigns.xlsx",
+        "mimeType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "bytes": list(xlsx)
+    }
+    logging.debug(f"[export_meta] GENERATED XLSX {len(xlsx)} bytes")
     return JSONResponse(content=resp)
 
 @app.get("/export_combined_active_campaigns_csv")
@@ -159,31 +227,19 @@ async def export_combined_active_campaigns_csv(
     google_rows = await google_ads_list_active(google_refresh_token)
     meta_rows   = await meta_ads_list_active(meta_account_id, meta_access_token)
     all_rows    = google_rows + meta_rows
-
-    buf = io.StringIO()
-    writer = csv.writer(buf)
-    total_impr   = sum(r.get("impressions", 0) for r in all_rows)
-    total_clicks = sum(r.get("clicks", 0) for r in all_rows)
-    ctr = (total_clicks / total_impr * 100) if total_impr > 0 else 0.0
-
-    writer.writerow(["Metric","Value"])
-    writer.writerow(["Active Campaigns", len(all_rows)])
-    writer.writerow(["Total Impressions", total_impr])
-    writer.writerow(["Total Clicks", total_clicks])
-    writer.writerow(["CTR (%)", f"{ctr:.2f}"])
-    writer.writerow([])
-    header = ["id","name","status","impressions","clicks"]
-    writer.writerow(header)
-    for r in all_rows:
-        writer.writerow([r.get(h, "") for h in header])
-    csv_bytes = buf.getvalue().encode("utf-8")
-
-    resp = {
-        "fileName": "combined_active_campaigns.csv",
-        "mimeType": "text/csv",
-        "bytes": list(csv_bytes)
+    metrics = {
+        'Active Campaigns': len(all_rows),
+        'Total Impressions': sum(r.get('impressions',0) for r in all_rows),
+        'Total Clicks':      sum(r.get('clicks',0) for r in all_rows),
+        'CTR (%)':           f"{(sum(r.get('clicks',0) for r in all_rows) / sum(r.get('impressions',0) for r in all_rows) * 100):.2f}"
     }
-    logging.debug(f"[export_combined_active_campaigns_csv] RESPONSE JSON: {resp}")
+    xlsx = create_excel_report(all_rows, metrics_summary=metrics, sheet_name='Combined Active')
+    resp = {
+        "fileName": "combined_active_campaigns.xlsx",
+        "mimeType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "bytes": list(xlsx)
+    }
+    logging.debug(f"[export_combined] GENERATED XLSX {len(xlsx)} bytes")
     return JSONResponse(content=resp)
 
 if __name__ == "__main__":
