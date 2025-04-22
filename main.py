@@ -111,19 +111,28 @@ async def meta_ads_list_active(account_id: str, access_token: str):
 async def export_google_active_campaigns_csv(
     google_refresh_token: str = Query(..., alias="google_refresh_token")
 ):
+    # 1) Busca dados via helper
     rows = await google_ads_list_active(google_refresh_token)
+
+    # 2) Gera o CSV em memória
     buf = io.StringIO()
     writer = csv.DictWriter(buf, fieldnames=["id","name","status","impressions","clicks"])
     writer.writeheader()
     writer.writerows(rows)
     csv_bytes = buf.getvalue().encode("utf-8")
-    logging.debug(f"[export_google_active_campaigns_csv] bytes length: {len(csv_bytes)}")
-    return {
+
+    # 3) Prepara o payload JSON com lista de bytes
+    resp = {
         "fileName": "google_active_campaigns.csv",
         "mimeType": "text/csv",
         "bytes": list(csv_bytes)
     }
 
+    # 4) Log completo do JSON que vamos devolver
+    logging.debug(f"[export_google_active_campaigns_csv] RESPONSE JSON: {resp}")
+
+    # 5) Retorna JSON explicitamente
+    return JSONResponse(content=resp)
 @app.get("/export_meta_active_campaigns_csv")
 async def export_meta_active_campaigns_csv(
     meta_account_id:   str = Query(..., alias="meta_account_id"),
