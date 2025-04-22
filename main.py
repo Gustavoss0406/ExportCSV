@@ -36,20 +36,14 @@ def sparkline(data):
         return ""
     mn, mx = min(data), max(data)
     span = mx - mn or 1
-    result = ""
-    for v in data:
-        idx = int((v - mn) / span * (len(SPARK_BARS)-1))
-        result += SPARK_BARS[idx]
-    return result
+    return "".join(SPARK_BARS[int((v - mn)/span*(len(SPARK_BARS)-1))] for v in data)
 
 # ───────── Helpers Google Ads ─────────
 async def get_access_token(refresh_token: str) -> str:
     creds = Credentials(
-        token=None,
-        refresh_token=refresh_token,
+        token=None, refresh_token=refresh_token,
         token_uri="https://oauth2.googleapis.com/token",
-        client_id=CLIENT_ID,
-        client_secret=CLIENT_SECRET,
+        client_id=CLIENT_ID, client_secret=CLIENT_SECRET,
     )
     creds.refresh(GoogleRequest())
     return creds.token
@@ -57,9 +51,9 @@ async def get_access_token(refresh_token: str) -> str:
 async def discover_customer_id(access_token: str) -> str:
     url = f"https://googleads.googleapis.com/{API_VERSION}/customers:listAccessibleCustomers"
     headers = {
-        "Authorization":   f"Bearer {access_token}",
+        "Authorization": f"Bearer {access_token}",
         "developer-token": DEVELOPER_TOKEN,
-        "Content-Type":    "application/json"
+        "Content-Type": "application/json"
     }
     async with aiohttp.ClientSession() as sess:
         async with sess.get(url, headers=headers) as resp:
@@ -72,10 +66,10 @@ async def discover_customer_id(access_token: str) -> str:
             return names[0].split("/")[-1]
 
 async def google_ads_list_active(refresh_token: str):
-    token       = await get_access_token(refresh_token)
-    cid         = await discover_customer_id(token)
-    url         = f"https://googleads.googleapis.com/{API_VERSION}/customers/{cid}/googleAds:search"
-    headers     = {
+    token = await get_access_token(refresh_token)
+    cid   = await discover_customer_id(token)
+    url   = f"https://googleads.googleapis.com/{API_VERSION}/customers/{cid}/googleAds:search"
+    headers = {
         "Authorization":   f"Bearer {token}",
         "developer-token": DEVELOPER_TOKEN,
         "Content-Type":    "application/json"
@@ -92,25 +86,20 @@ async def google_ads_list_active(refresh_token: str):
             if resp.status != 200:
                 raise HTTPException(resp.status, text)
             results = json.loads(text).get("results", [])
-    rows = []
-    for r in results:
-        imp = int(r["metrics"]["impressions"])
-        clk = int(r["metrics"]["clicks"])
-        rows.append({
-            "id":          r["campaign"]["id"],
-            "name":        r["campaign"]["name"],
-            "status":      r["campaign"]["status"],
-            "impressions": imp,
-            "clicks":      clk,
-            "ctr (%)":     round(clk / max(imp,1) * 100, 2)
-        })
-    return rows
+    return [{
+        "id":           r["campaign"]["id"],
+        "name":         r["campaign"]["name"],
+        "status":       r["campaign"]["status"],
+        "impressions":  int(r["metrics"]["impressions"]),
+        "clicks":       int(r["metrics"]["clicks"]),
+        "ctr (%)":      round(int(r["metrics"]["clicks"])/max(int(r["metrics"]["impressions"]),1)*100,2)
+    } for r in results]
 
 async def google_ads_list_trends(refresh_token: str, days: int = 7):
-    token       = await get_access_token(refresh_token)
-    cid         = await discover_customer_id(token)
-    url         = f"https://googleads.googleapis.com/{API_VERSION}/customers/{cid}/googleAds:search"
-    headers     = {
+    token = await get_access_token(refresh_token)
+    cid   = await discover_customer_id(token)
+    url   = f"https://googleads.googleapis.com/{API_VERSION}/customers/{cid}/googleAds:search"
+    headers = {
         "Authorization":   f"Bearer {token}",
         "developer-token": DEVELOPER_TOKEN,
         "Content-Type":    "application/json"
@@ -129,20 +118,18 @@ async def google_ads_list_trends(refresh_token: str, days: int = 7):
             results = json.loads(text).get("results", [])
     by_date = defaultdict(lambda: {"impressions":0,"clicks":0})
     for r in results:
-        date = r["segments"]["date"]
-        by_date[date]["impressions"] += int(r["metrics"]["impressions"])
-        by_date[date]["clicks"]     += int(r["metrics"]["clicks"])
-    # sort by date
-    dates = sorted(by_date.keys())
-    imps  = [by_date[d]["impressions"] for d in dates]
-    clks  = [by_date[d]["clicks"] for d in dates]
-    return dates, imps, clks
+        d = r["segments"]["date"]
+        by_date[d]["impressions"] += int(r["metrics"]["impressions"])
+        by_date[d]["clicks"]     += int(r["metrics"]["clicks"])
+    dates = sorted(by_date)
+    return dates, [by_date[d]["impressions"] for d in dates], [by_date[d]["clicks"] for d in dates]
 
 # ───────── Helpers Meta Ads ─────────
 async def meta_ads_list_active(account_id: str, access_token: str):
+    # 1) lista campanhas
     url = f"https://graph.facebook.com/v16.0/act_{account_id}/campaigns"
     params = {
-        "fields":       "id,name,status,insights.date_preset(lifetime){impressions,clicks,spend}",
+        "fields":       "id,name,status",
         "filtering":    json.dumps([{"field":"effective_status","operator":"IN","value":["ACTIVE"]}]),
         "access_token": access_token
     }
@@ -152,12 +139,36 @@ async def meta_ads_list_active(account_id: str, access_token: str):
             if resp.status != 200:
                 raise HTTPException(resp.status, text)
             data = json.loads(text).get("data", [])
-    rows=[]
+    ids = [c["id"] for c in data]
+
+    # 2) busca métricas via /insights (sem usar date_preset)
+    insights = []
+    if ids:
+        ins_url = f"https://graph.facebook.com/v16.0/act_{account_id}/insights"
+        since = "2000-01-01"
+        until = datetime.now().date().isoformat()
+        params = {
+            "level":       "campaign",
+            "fields":      "campaign_id,impressions,clicks,spend",
+            "filtering":   json.dumps([{"field":"campaign.id","operator":"IN","value":ids}]),
+            "time_range":  json.dumps({"since":since,"until":until}),
+            "access_token":access_token
+        }
+        async with aiohttp.ClientSession() as sess:
+            async with sess.get(ins_url, params=params) as resp:
+                text = await resp.text()
+                if resp.status != 200:
+                    raise HTTPException(resp.status, f"Meta Ads insights error: {text}")
+                insights = json.loads(text).get("data", [])
+
+    # 3) mapeia métricas por campanha
+    metrics_map = {i["campaign_id"]: i for i in insights}
+    rows = []
     for c in data:
-        ins = c.get("insights",{}).get("data",[{}])[0]
-        imp = int(ins.get("impressions",0))
-        clk = int(ins.get("clicks",0))
-        spd = float(ins.get("spend",0.0))
+        m = metrics_map.get(c["id"], {})
+        imp = int(m.get("impressions",0))
+        clk = int(m.get("clicks",0))
+        spd = float(m.get("spend",0))
         rows.append({
             "id":           c["id"],
             "name":         c["name"],
@@ -165,8 +176,8 @@ async def meta_ads_list_active(account_id: str, access_token: str):
             "impressions":  imp,
             "clicks":       clk,
             "spend":        round(spd,2),
-            "ctr (%)":      round(clk / max(imp,1) * 100,2),
-            "cpc":          round(spd / max(clk,1),2)
+            "ctr (%)":      round(clk/max(imp,1)*100,2),
+            "cpc":          round(spd/max(clk,1),2)
         })
     return rows
 
@@ -175,11 +186,12 @@ async def meta_ads_list_trends(account_id: str, access_token: str, days: int = 7
     since = (datetime.now().date() - timedelta(days=days)).isoformat()
     until = datetime.now().date().isoformat()
     params = {
-        "fields":         "date_start,impressions,clicks,spend",
-        "time_increment": 1,
-        "time_range":     json.dumps({"since":since,"until":until}),
-        "filtering":      json.dumps([{"field":"effective_status","operator":"IN","value":["ACTIVE"]}]),
-        "access_token":   access_token
+        "level":        "campaign",
+        "fields":       "date_start,impressions,clicks,spend",
+        "time_increment":1,
+        "time_range":   json.dumps({"since":since,"until":until}),
+        "filtering":    json.dumps([{"field":"effective_status","operator":"IN","value":["ACTIVE"]}]),
+        "access_token": access_token
     }
     async with aiohttp.ClientSession() as sess:
         async with sess.get(url, params=params) as resp:
@@ -189,189 +201,104 @@ async def meta_ads_list_trends(account_id: str, access_token: str, days: int = 7
             data = json.loads(text).get("data", [])
     by_date = defaultdict(lambda: {"impressions":0,"clicks":0})
     for d in data:
-        date = d["date_start"]
-        by_date[date]["impressions"] += int(d["impressions"])
-        by_date[date]["clicks"]     += int(d["clicks"])
-    dates = sorted(by_date.keys())
-    imps  = [by_date[d]["impressions"] for d in dates]
-    clks  = [by_date[d]["clicks"] for d in dates]
-    return dates, imps, clks
+        dt = d["date_start"]
+        by_date[dt]["impressions"] += int(d["impressions"])
+        by_date[dt]["clicks"]     += int(d["clicks"])
+    dates = sorted(by_date)
+    return dates, [by_date[d]["impressions"] for d in dates], [by_date[d]["clicks"] for d in dates]
 
-# ───────── Endpoint Google CSV com review e gráficos ─────────
+# ───────── Endpoints (CSV + review + gráficos) ─────────
 @app.get("/export_google_active_campaigns_csv")
-async def export_google_active_campaigns_csv(
-    google_refresh_token: str = Query(..., alias="google_refresh_token")
-):
-    rows   = await google_ads_list_active(google_refresh_token)
-    dates, imps, clks = await google_ads_list_trends(google_refresh_token)
-
-    # sumários
+async def export_google_active_campaigns_csv(google_refresh_token: str = Query(..., alias="google_refresh_token")):
+    rows, (dates, imps, clks) = (await google_ads_list_active(google_refresh_token),
+                                 await google_ads_list_trends(google_refresh_token))
     total_imp = sum(r["impressions"] for r in rows)
     total_clk = sum(r["clicks"] for r in rows)
-    avg_ctr   = round(total_clk / max(total_imp,1) * 100, 2)
-    review = (
-        f"Google Ads: {len(rows)} campanhas ativas | "
-        f"Total {total_imp} impressões, {total_clk} cliques | CTR médio {avg_ctr}%"
-    )
-    spark_imp = sparkline(imps)
-    spark_clk = sparkline(clks)
-
+    avg_ctr   = round(total_clk/max(total_imp,1)*100,2)
+    review    = f"Google Ads: {len(rows)} campanhas | Imps {total_imp}, Cliques {total_clk}, CTR {avg_ctr}%"
     buf = io.StringIO()
-    writer = csv.writer(buf)
-
-    # Review geral
-    writer.writerow(["Review", review])
-    writer.writerow([])
-
-    # Tendências (sparklines)
-    writer.writerow(["Date"] + dates)
-    writer.writerow(["Impressions Trend"] + [spark_imp])
-    writer.writerow(["Clicks Trend"]     + [spark_clk])
-    writer.writerow([])
-
-    # Métricas gerais
-    writer.writerow(["Metric","Value"])
-    writer.writerow(["Active Campaigns", len(rows)])
-    writer.writerow(["Total Impressions", total_imp])
-    writer.writerow(["Total Clicks", total_clk])
-    writer.writerow(["Average CTR (%)", avg_ctr])
-    writer.writerow([])
-
-    # Métricas por campanha
-    writer.writerow(["Campaign ID","Name","Status","Impressions","Clicks","CTR (%)"])
+    w = csv.writer(buf)
+    # review
+    w.writerow(["Review", review]); w.writerow([])
+    # sparklines
+    w.writerow(["Date"] + dates)
+    w.writerow(["Impressions Trend", sparkline(imps)])
+    w.writerow(["Clicks Trend",      sparkline(clks)]); w.writerow([])
+    # métricas gerais
+    w.writerow(["Metric","Value"])
+    w.writerow(["Active Campaigns", len(rows)])
+    w.writerow(["Total Impressions", total_imp])
+    w.writerow(["Total Clicks",      total_clk])
+    w.writerow(["Average CTR (%)",   avg_ctr]); w.writerow([])
+    # por campanha
+    w.writerow(["ID","Name","Status","Imps","Clicks","CTR (%)"])
     for r in rows:
-        writer.writerow([
-            r["id"], r["name"], r["status"],
-            r["impressions"], r["clicks"], r["ctr (%)"]
-        ])
-
+        w.writerow([r["id"],r["name"],r["status"],r["impressions"],r["clicks"],r["ctr (%)"]])
     data = buf.getvalue().encode("utf-8")
-    return JSONResponse({
-        "fileName": "google_active_campaigns.csv",
-        "mimeType": "text/csv",
-        "bytes": list(data)
-    })
+    return JSONResponse({"fileName":"google_active_campaigns.csv","mimeType":"text/csv","bytes":list(data)})
 
-# ───────── Endpoint Meta CSV com review e gráficos ─────────
 @app.get("/export_meta_active_campaigns_csv")
 async def export_meta_active_campaigns_csv(
-    meta_account_id:   str = Query(..., alias="meta_account_id"),
+    meta_account_id: str = Query(..., alias="meta_account_id"),
     meta_access_token: str = Query(..., alias="meta_access_token")
 ):
-    rows   = await meta_ads_list_active(meta_account_id, meta_access_token)
-    dates, imps, clks = await meta_ads_list_trends(meta_account_id, meta_access_token)
-
+    rows, (dates, imps, clks) = (await meta_ads_list_active(meta_account_id, meta_access_token),
+                                 await meta_ads_list_trends(meta_account_id, meta_access_token))
     total_imp = sum(r["impressions"] for r in rows)
     total_clk = sum(r["clicks"] for r in rows)
     total_spd = round(sum(r["spend"] for r in rows),2)
-    avg_ctr   = round(total_clk / max(total_imp,1) * 100,2)
-    avg_cpc   = round(total_spd / max(total_clk,1),2)
-    review = (
-        f"Meta Ads: {len(rows)} campanhas ativas | "
-        f"Total {total_imp} impressões, {total_clk} cliques, spend {total_spd} | "
-        f"CTR {avg_ctr}%, CPC {avg_cpc}"
-    )
-    spark_imp = sparkline(imps)
-    spark_clk = sparkline(clks)
-
+    avg_ctr   = round(total_clk/max(total_imp,1)*100,2)
+    avg_cpc   = round(total_spd/max(total_clk,1),2)
+    review    = f"Meta Ads: {len(rows)} campanhas | Imps {total_imp}, Cliques {total_clk}, Spend {total_spd}, CTR {avg_ctr}%, CPC {avg_cpc}"
     buf = io.StringIO()
-    writer = csv.writer(buf)
-
-    writer.writerow(["Review", review])
-    writer.writerow([])
-
-    writer.writerow(["Date"] + dates)
-    writer.writerow(["Impressions Trend"] + [spark_imp])
-    writer.writerow(["Clicks Trend"]     + [spark_clk])
-    writer.writerow([])
-
-    writer.writerow(["Metric","Value"])
-    writer.writerow(["Active Campaigns", len(rows)])
-    writer.writerow(["Total Impressions", total_imp])
-    writer.writerow(["Total Clicks", total_clk])
-    writer.writerow(["Total Spend", total_spd])
-    writer.writerow(["Average CTR (%)", avg_ctr])
-    writer.writerow(["Average CPC", avg_cpc])
-    writer.writerow([])
-
-    writer.writerow(["Campaign ID","Name","Status","Impressions","Clicks","Spend","CTR (%)","CPC"])
+    w = csv.writer(buf)
+    w.writerow(["Review", review]); w.writerow([])
+    w.writerow(["Date"] + dates)
+    w.writerow(["Impressions Trend", sparkline(imps)])
+    w.writerow(["Clicks Trend",      sparkline(clks)]); w.writerow([])
+    w.writerow(["Metric","Value"])
+    w.writerow(["Active Campaigns", len(rows)])
+    w.writerow(["Total Impressions", total_imp])
+    w.writerow(["Total Clicks",      total_clk])
+    w.writerow(["Total Spend",       total_spd])
+    w.writerow(["Average CTR (%)",   avg_ctr])
+    w.writerow(["Average CPC",       avg_cpc]); w.writerow([])
+    w.writerow(["ID","Name","Status","Imps","Clicks","Spend","CTR (%)","CPC"])
     for r in rows:
-        writer.writerow([
-            r["id"], r["name"], r["status"],
-            r["impressions"], r["clicks"], r["spend"],
-            r["ctr (%)"], r["cpc"]
-        ])
-
+        w.writerow([r["id"],r["name"],r["status"],r["impressions"],r["clicks"],r["spend"],r["ctr (%)"],r["cpc"]])
     data = buf.getvalue().encode("utf-8")
-    return JSONResponse({
-        "fileName": "meta_active_campaigns.csv",
-        "mimeType": "text/csv",
-        "bytes": list(data)
-    })
+    return JSONResponse({"fileName":"meta_active_campaigns.csv","mimeType":"text/csv","bytes":list(data)})
 
-# ───────── Endpoint Combined CSV com review e gráficos ─────────
 @app.get("/export_combined_active_campaigns_csv")
 async def export_combined_active_campaigns_csv(
     google_refresh_token: str = Query(..., alias="google_refresh_token"),
-    meta_account_id:     str = Query(..., alias="meta_account_id"),
-    meta_access_token:   str = Query(..., alias="meta_access_token")
+    meta_account_id: str = Query(..., alias="meta_account_id"),
+    meta_access_token: str = Query(..., alias="meta_access_token")
 ):
-    g_rows = await google_ads_list_active(google_refresh_token)
-    m_rows = await meta_ads_list_active(meta_account_id, meta_access_token)
+    g_rows, _ = await (google_ads_list_active(google_refresh_token), google_ads_list_trends(google_refresh_token))
+    m_rows, _ = await (meta_ads_list_active(meta_account_id, meta_access_token), meta_ads_list_trends(meta_account_id, meta_access_token))
     rows   = g_rows + m_rows
-
-    # trends combinadas (somente impressões e cliques de ambas)
-    g_dates, g_imps, g_clks = await google_ads_list_trends(google_refresh_token)
-    m_dates, m_imps, m_clks = await meta_ads_list_trends(meta_account_id, meta_access_token)
-    # assume mesmas datas
-    dates = g_dates if g_dates else m_dates
-    imps  = [gi + mi for gi,mi in zip(g_imps, m_imps)]
-    clks  = [gc + mc for gc,mc in zip(g_clks, m_clks)]
-    
-    total_imp = sum(r["impressions"] for r in rows)
-    total_clk = sum(r["clicks"] for r in rows)
-    avg_ctr   = round(total_clk / max(total_imp,1) * 100,2)
-    spark_imp = sparkline(imps)
-    spark_clk = sparkline(clks)
-    review = (
-        f"Combined Ads: Google {len(g_rows)} + Meta {len(m_rows)} = {len(rows)} campanhas | "
-        f"Imps {total_imp}, Clicks {total_clk}, CTR {avg_ctr}%"
-    )
-
-    buf = io.StringIO()
-    writer = csv.writer(buf)
-
-    writer.writerow(["Review", review])
-    writer.writerow([])
-
-    writer.writerow(["Date"] + dates)
-    writer.writerow(["Impressions Trend"] + [spark_imp])
-    writer.writerow(["Clicks Trend"]     + [spark_clk])
-    writer.writerow([])
-
-    writer.writerow(["Metric","Value"])
-    writer.writerow(["Google Active",      len(g_rows)])
-    writer.writerow(["Meta Active",        len(m_rows)])
-    writer.writerow(["Total Campaigns",    len(rows)])
-    writer.writerow(["Total Impressions",  total_imp])
-    writer.writerow(["Total Clicks",       total_clk])
-    writer.writerow(["Overall CTR (%)",    avg_ctr])
-    writer.writerow([])
-
-    writer.writerow(["Campaign ID","Network","Name","Status","Impressions","Clicks","CTR (%)"])
+    dates, imps, clks = await google_ads_list_trends(google_refresh_token)
+    # combine trends
+    buf = io.StringIO(); w = csv.writer(buf)
+    review = f"Combined: Google {len(g_rows)} + Meta {len(m_rows)} = {len(rows)} campanhas | Imps {sum(r['impressions'] for r in rows)}, Clicks {sum(r['clicks'] for r in rows)}"
+    w.writerow(["Review", review]); w.writerow([])
+    w.writerow(["Date"] + dates)
+    w.writerow(["Impressions Trend", sparkline(imps)])
+    w.writerow(["Clicks Trend",      sparkline(clks)]); w.writerow([])
+    w.writerow(["Metric","Value"])
+    w.writerow(["Google Active",    len(g_rows)])
+    w.writerow(["Meta Active",      len(m_rows)])
+    w.writerow(["Total Campaigns",  len(rows)])
+    w.writerow(["Total Impressions",sum(r["impressions"] for r in rows)])
+    w.writerow(["Total Clicks",     sum(r["clicks"] for r in rows)])
+    w.writerow([]); w.writerow(["ID","Network","Name","Status","Imps","Clicks","CTR (%)"])
     for r in rows:
-        network = "Google" if "spend" not in r else "Meta"
-        writer.writerow([
-            r["id"], network, r.get("name",""), r.get("status",""),
-            r["impressions"], r["clicks"], r["ctr (%)"]
-        ])
-
+        net = "Google" if "ctr (%)" in r and "cpc" not in r else "Meta"
+        w.writerow([r["id"], net, r.get("name",""), r.get("status",""), r["impressions"], r["clicks"], r["ctr (%)"]])
     data = buf.getvalue().encode("utf-8")
-    return JSONResponse({
-        "fileName": "combined_active_campaigns.csv",
-        "mimeType": "text/csv",
-        "bytes": list(data)
-    })
+    return JSONResponse({"fileName":"combined_active_campaigns.csv","mimeType":"text/csv","bytes":list(data)})
+
 
 if __name__ == "__main__":
     logging.info("Starting export service on port 8080")
