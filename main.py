@@ -278,4 +278,6 @@ async def export_combined_active_campaigns_csv(
 
 
 if __name__ == "__main__":
-    logging.info("Starting export service on port 808
+    logging.info("Starting export service on port 8080")
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8080, reload=True)
