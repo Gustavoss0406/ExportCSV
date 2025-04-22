@@ -3,3 +3,4 @@ uvicorn[standard]
 aiohttp
 google-auth
 requests
+pandas
