@@ -91,7 +91,6 @@ async def google_ads_list(refresh_token: str, with_trends: bool = False):
         })
     df = pd.DataFrame(rows)
 
-    # Tendências últimos 7 dias
     trends = None
     if with_trends:
         q_trend = """
@@ -170,7 +169,6 @@ async def meta_ads_list(refresh_token: str, account_id: str, with_trends: bool =
 
     trends = None
     if with_trends:
-        # reuse insights data by_date
         by_date = defaultdict(lambda: {"Impressions":0,"Clicks":0})
         for d in insights:
             dt = d["date_start"]
@@ -188,7 +186,6 @@ async def meta_ads_list(refresh_token: str, account_id: str, with_trends: bool =
 def make_xlsx(df: pd.DataFrame, trends: pd.DataFrame, sheet_name: str) -> bytes:
     bio = io.BytesIO()
     with pd.ExcelWriter(bio, engine="openpyxl") as writer:
-        # Aba de dados
         df.to_excel(writer, sheet_name=sheet_name, index=False, startrow=4)
         wb = writer.book
         ws = writer.sheets[sheet_name]
@@ -232,8 +229,6 @@ def make_xlsx(df: pd.DataFrame, trends: pd.DataFrame, sheet_name: str) -> bytes:
             chart.add_data(data_ref, titles_from_data=True)
             chart.set_categories(cats_ref)
             ws2.add_chart(chart, "E2")
-
-        writer.save()
     return bio.getvalue()
 
 # ───────── Endpoints XLSX ─────────
@@ -270,7 +265,6 @@ async def export_combined_xlsx(
     g_df, g_tr = await google_ads_list(google_refresh_token, with_trends=True)
     m_df, m_tr = await meta_ads_list(meta_access_token, meta_account_id, with_trends=True)
     df = pd.concat([g_df, m_df], ignore_index=True)
-    # merge trends
     tr = pd.merge(g_tr, m_tr, on="Date", how="outer", suffixes=("_G","_M")).fillna(0)
     tr["Impressions"] = tr["Impressions_G"] + tr["Impressions_M"]
     tr["Clicks"]      = tr["Clicks_G"] + tr["Clicks_M"]
