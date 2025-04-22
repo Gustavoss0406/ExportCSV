@@ -4,3 +4,4 @@ aiohttp
 google-auth
 requests
 pandas
+openpyxl
