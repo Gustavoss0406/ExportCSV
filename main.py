@@ -84,16 +84,17 @@ async def google_ads_list(refresh_token: str, with_trends: bool = False):
     for r in results:
         imp = int(r["metrics"]["impressions"])
         clk = int(r["metrics"]["clicks"])
-        spend = r["metrics"].get("costMicros", 0) / 1e6
+        micros = r["metrics"].get("costMicros", 0)
+        spend = float(micros) / 1e6
         rows.append({
             "Campaign ID": r["campaign"]["id"],
             "Name":        r["campaign"]["name"],
             "Status":      r["campaign"]["status"],
             "Impressions": imp,
             "Clicks":      clk,
-            "Spend":       round(spend,2),
-            "CTR (%)":     round(clk / max(imp,1) * 100,2),
-            "CPC":         round(spend / max(clk,1),2)
+            "Spend":       round(spend, 2),
+            "CTR (%)":     round(clk / max(imp,1) * 100, 2),
+            "CPC":         round(spend / max(clk,1), 2)
         })
     df = pd.DataFrame(rows)
 
@@ -111,18 +112,19 @@ async def google_ads_list(refresh_token: str, with_trends: bool = False):
                 if resp.status != 200:
                     raise HTTPException(resp.status, f"Google trend: {text}")
                 results = json.loads(text).get("results", [])
-        by_date = defaultdict(lambda: {"Impressions":0,"Clicks":0,"Spend":0})
+        by_date = defaultdict(lambda: {"Impressions":0, "Clicks":0, "Spend":0})
         for r in results:
             d = r["segments"]["date"]
             by_date[d]["Impressions"] += int(r["metrics"]["impressions"])
             by_date[d]["Clicks"]      += int(r["metrics"]["clicks"])
-            by_date[d]["Spend"]       += r["metrics"].get("costMicros",0)/1e6
+            micros = r["metrics"].get("costMicros", 0)
+            by_date[d]["Spend"]       += float(micros) / 1e6
         dates = sorted(by_date)
         trends = pd.DataFrame({
             "Date":        dates,
             "Impressions": [by_date[d]["Impressions"] for d in dates],
             "Clicks":      [by_date[d]["Clicks"] for d in dates],
-            "Spend":       [round(by_date[d]["Spend"],2) for d in dates],
+            "Spend":       [round(by_date[d]["Spend"], 2) for d in dates],
         })
 
     return df, trends
@@ -166,7 +168,7 @@ async def meta_ads_list(refresh_token: str, account_id: str, with_trends: bool =
             "Status":      c["status"],
             "Impressions": imp,
             "Clicks":      clk,
-            "Spend":       round(spd,2),
+            "Spend":       round(spd, 2),
             "CTR (%)":     round(clk / max(imp,1) * 100,2),
             "CPC":         round(spd / max(clk,1),2)
         })
@@ -174,18 +176,18 @@ async def meta_ads_list(refresh_token: str, account_id: str, with_trends: bool =
 
     trends = None
     if with_trends:
-        by_date = defaultdict(lambda: {"Impressions":0,"Clicks":0,"Spend":0})
+        by_date = defaultdict(lambda: {"Impressions":0, "Clicks":0, "Spend":0})
         for i in insights:
-            dt = i["date_start"]
-            by_date[dt]["Impressions"] += int(i.get("impressions",0))
-            by_date[dt]["Clicks"]      += int(i.get("clicks",0))
-            by_date[dt]["Spend"]       += float(i.get("spend",0))
+            dt = i.get("date_start")
+            by_date[dt]["Impressions"] += int(i.get("impressions", 0))
+            by_date[dt]["Clicks"]      += int(i.get("clicks", 0))
+            by_date[dt]["Spend"]       += float(i.get("spend", 0))
         dates = sorted(by_date)
         trends = pd.DataFrame({
             "Date":        dates,
             "Impressions": [by_date[d]["Impressions"] for d in dates],
             "Clicks":      [by_date[d]["Clicks"] for d in dates],
-            "Spend":       [by_date[d]["Spend"] for d in dates],
+            "Spend":       [round(by_date[d]["Spend"], 2) for d in dates],
         })
 
     return df, trends
@@ -217,16 +219,13 @@ def make_xlsx(df: pd.DataFrame, trends: pd.DataFrame) -> bytes:
         chart_rows = {"Active Campaigns": 20, "Impressions": 20, "Clicks": 35, "Spend": 50}
         col = 1
         for title, value in kpis.items():
-            # title cell
             ws.merge_cells(1, col, 1, col+1)
             c1 = ws.cell(1, col, title)
             c1.font  = header_font; c1.fill = PatternFill("solid", fgColor=primary); c1.alignment = align
-            # value cell as hyperlink
-            link = f"'#Report'!A{chart_rows[title]}"
-            formula = f'=HYPERLINK("{link}", "{value}")'
             ws.merge_cells(2, col, 2, col+1)
             c2 = ws.cell(2, col)
-            c2.value = formula; c2.font = val_font; c2.fill = PatternFill("solid", fgColor=secondary); c2.alignment = align
+            c2.value = f'=HYPERLINK("#Report!A{chart_rows[title]}", "{value}")'
+            c2.font  = val_font; c2.fill = PatternFill("solid", fgColor=secondary); c2.alignment = align
             col += 2
 
         # 2) Data table header style
@@ -238,23 +237,20 @@ def make_xlsx(df: pd.DataFrame, trends: pd.DataFrame) -> bytes:
             ws.column_dimensions[get_column_letter(idx)].width = max(len(col_name)+2, 15)
         ws.freeze_panes = "A7"
         ws.sheet_view.showGridLines = False
-        # Excel Table
         max_row, max_col = df.shape
         tab_ref = f"A6:{get_column_letter(max_col)}{6+max_row}"
-        table = Table("DataTable", tab_ref)
-        table.tableStyleInfo = TableStyleInfo("TableStyleMedium2", showRowStripes=True)
+        table = Table(displayName="DataTable", ref=tab_ref)
+        table.tableStyleInfo = TableStyleInfo("TableStyleLight9", showRowStripes=True)
         ws.add_table(table)
 
-        # 3) Charts in same sheet
+        # 3) Trends and Spend charts in same sheet
         if trends is not None:
-            # write trends data below table
             start = 8 + max_row
             for i, (_, row) in enumerate(trends.iterrows(), start=0):
                 ws.cell(start+i, 1, row["Date"])
                 ws.cell(start+i, 2, row["Impressions"])
                 ws.cell(start+i, 3, row["Clicks"])
                 ws.cell(start+i, 4, row["Spend"])
-            # Impressions & Clicks chart
             chart1 = LineChart()
             chart1.title = "Impressions & Clicks (7d)"
             chart1.x_axis.title = "Date"; chart1.y_axis.title = "Count"
@@ -263,7 +259,7 @@ def make_xlsx(df: pd.DataFrame, trends: pd.DataFrame) -> bytes:
             chart1.add_data(data_ref, titles_from_data=True)
             chart1.set_categories(cats_ref)
             ws.add_chart(chart1, "F20")
-            # Spend chart
+
             chart2 = LineChart()
             chart2.title = "Spend (7d)"
             chart2.x_axis.title = "Date"; chart2.y_axis.title = "USD"
