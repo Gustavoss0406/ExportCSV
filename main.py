@@ -2,9 +2,9 @@ import logging
 import json
 import csv
 import io
-import base64
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 import aiohttp
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request as GoogleRequest
@@ -107,36 +107,23 @@ async def meta_ads_list_active(account_id: str, access_token: str):
         for c in data
     ]
 
-# ───────── GET Endpoints returning Base64 JSON ─────────
+# ───────── GET Endpoints returning CSV directly ─────────
 
 @app.get("/export_google_active_campaigns_csv")
 async def export_google_active_campaigns_csv(
     google_refresh_token: str = Query(..., alias="google_refresh_token")
 ):
-    # 1) Busca dados via helper
     rows = await google_ads_list_active(google_refresh_token)
-
-    # 2) Gera o CSV em memória
     buf = io.StringIO()
     writer = csv.DictWriter(buf, fieldnames=["id","name","status","impressions","clicks"])
     writer.writeheader()
     writer.writerows(rows)
-
-    # 3) Converte para bytes e codifica em Base64
-    csv_bytes = buf.getvalue().encode("utf-8")
-    b64 = base64.b64encode(csv_bytes).decode("utf-8")
-
-    # 4) Log do fileBytes (ou apenas do tamanho se for muito grande)
-    logging.debug(f"[export_google_active_campaigns_csv] fileBytes length: {len(b64)}")
-    # Se quiser ver o conteúdo completo (cuidado, pode lotar o log):
-    # logging.debug(f"[export_google_active_campaigns_csv] fileBytes: {b64}")
-
-    # 5) Retorna JSON para o FlutterFlow
-    return {
-        "fileName": "google_active_campaigns.csv",
-        "mimeType": "text/csv",
-        "fileBytes": b64
-    }
+    buf.seek(0)
+    return StreamingResponse(
+        buf,
+        media_type="text/csv",
+        headers={"Content-Disposition":"attachment; filename=google_active_campaigns.csv"}
+    )
 
 @app.get("/export_meta_active_campaigns_csv")
 async def export_meta_active_campaigns_csv(
@@ -148,13 +135,12 @@ async def export_meta_active_campaigns_csv(
     writer = csv.DictWriter(buf, fieldnames=["id","name","status"])
     writer.writeheader()
     writer.writerows(rows)
-    csv_bytes = buf.getvalue().encode("utf-8")
-    b64 = base64.b64encode(csv_bytes).decode("utf-8")
-    return {
-        "fileName": "meta_active_campaigns.csv",
-        "mimeType": "text/csv",
-        "fileBytes": b64
-    }
+    buf.seek(0)
+    return StreamingResponse(
+        buf,
+        media_type="text/csv",
+        headers={"Content-Disposition":"attachment; filename=meta_active_campaigns.csv"}
+    )
 
 @app.get("/export_combined_active_campaigns_csv")
 async def export_combined_active_campaigns_csv(
@@ -168,7 +154,6 @@ async def export_combined_active_campaigns_csv(
 
     buf = io.StringIO()
     writer = csv.writer(buf)
-    # cabeçalho de métricas
     total_impr   = sum(r.get("impressions", 0) for r in all_rows)
     total_clicks = sum(r.get("clicks", 0) for r in all_rows)
     ctr = (total_clicks / total_impr * 100) if total_impr > 0 else 0.0
@@ -179,19 +164,16 @@ async def export_combined_active_campaigns_csv(
     writer.writerow(["Total Clicks", total_clicks])
     writer.writerow(["CTR (%)", f"{ctr:.2f}"])
     writer.writerow([])
-    # linhas detalhadas
     header = ["id","name","status","impressions","clicks"]
     writer.writerow(header)
     for r in all_rows:
         writer.writerow([r.get(h, "") for h in header])
-
-    csv_bytes = buf.getvalue().encode("utf-8")
-    b64 = base64.b64encode(csv_bytes).decode("utf-8")
-    return {
-        "fileName": "combined_active_campaigns.csv",
-        "mimeType": "text/csv",
-        "fileBytes": b64
-    }
+    buf.seek(0)
+    return StreamingResponse(
+        buf,
+        media_type="text/csv",
+        headers={"Content-Disposition":"attachment; filename=combined_active_campaigns.csv"}
+    )
 
 if __name__ == "__main__":
     logging.info("Starting export service on port 8080")
