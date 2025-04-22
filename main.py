@@ -33,6 +33,7 @@ app.add_middleware(
 )
 
 # ───────── Helpers ─────────
+
 async def get_access_token(refresh_token: str) -> str:
     try:
         creds = Credentials(
@@ -62,10 +63,9 @@ async def discover_customer_id(token: str) -> str:
 async def google_ads_list(refresh_token: str, with_trends: bool = False):
     token = await get_access_token(refresh_token)
     cid   = await discover_customer_id(token)
-    base_url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{cid}/googleAds:search"
-    headers  = {"Authorization": f"Bearer {token}", "developer-token": DEVELOPER_TOKEN}
+    url   = f"https://googleads.googleapis.com/{API_VERSION}/customers/{cid}/googleAds:search"
+    headers = {"Authorization": f"Bearer {token}", "developer-token": DEVELOPER_TOKEN}
 
-    # Campanhas ativas
     q_active = """
         SELECT campaign.id, campaign.name, campaign.status,
                metrics.impressions, metrics.clicks
@@ -73,7 +73,7 @@ async def google_ads_list(refresh_token: str, with_trends: bool = False):
         WHERE campaign.status = 'ENABLED'
     """
     async with aiohttp.ClientSession() as sess:
-        async with sess.post(base_url, headers=headers, json={"query": q_active}) as resp:
+        async with sess.post(url, headers=headers, json={"query": q_active}) as resp:
             text = await resp.text()
             if resp.status != 200:
                 raise HTTPException(resp.status, f"Google search: {text}")
@@ -101,7 +101,7 @@ async def google_ads_list(refresh_token: str, with_trends: bool = False):
               AND segments.date DURING LAST_7_DAYS
         """
         async with aiohttp.ClientSession() as sess:
-            async with sess.post(base_url, headers=headers, json={"query": q_trend}) as resp:
+            async with sess.post(url, headers=headers, json={"query": q_trend}) as resp:
                 text = await resp.text()
                 if resp.status != 200:
                     raise HTTPException(resp.status, f"Google trend: {text}")
@@ -121,7 +121,6 @@ async def google_ads_list(refresh_token: str, with_trends: bool = False):
     return df, trends
 
 async def meta_ads_list(refresh_token: str, account_id: str, with_trends: bool = False):
-    # Campanhas
     url_c = f"https://graph.facebook.com/v16.0/act_{account_id}/campaigns"
     params = {"fields":"id,name,status","access_token": refresh_token}
     async with aiohttp.ClientSession() as sess:
@@ -132,7 +131,6 @@ async def meta_ads_list(refresh_token: str, account_id: str, with_trends: bool =
             data = json.loads(text).get("data", [])
     active = [c for c in data if c["status"]=="ACTIVE"]
 
-    # Insights últimos 7 dias
     ins_url = f"https://graph.facebook.com/v16.0/act_{account_id}/insights"
     since = (datetime.now().date() - timedelta(days=7)).isoformat()
     until = datetime.now().date().isoformat()
@@ -172,9 +170,9 @@ async def meta_ads_list(refresh_token: str, account_id: str, with_trends: bool =
     if with_trends:
         by_date = defaultdict(lambda: {"Impressions":0,"Clicks":0})
         for d in insights:
-            dt = d["date_start"]
-            by_date[dt]["Impressions"] += int(d["impressions"])
-            by_date[dt]["Clicks"]      += int(d["clicks"])
+            dt = d.get("date_start") or d.get("date")
+            by_date[dt]["Impressions"] += int(d.get("impressions",0))
+            by_date[dt]["Clicks"]      += int(d.get("clicks",0))
         dates = sorted(by_date)
         trends = pd.DataFrame({
             "Date":        dates,
@@ -185,12 +183,12 @@ async def meta_ads_list(refresh_token: str, account_id: str, with_trends: bool =
     return df, trends
 
 def make_xlsx(df: pd.DataFrame, trends: pd.DataFrame, sheet_name: str) -> bytes:
-    bio = io.BytesIO()
-    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
-        # 1) Cria aba Dashboard
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         wb = writer.book
+
+        # Dashboard sheet
         ws_dash = wb.create_sheet("Dashboard", 0)
-        # KPI cards (merge 2x2 cells cada)
         kpis = {
             "Active Campaigns": len(df),
             "Impressions":      int(df["Impressions"].sum()),
@@ -198,44 +196,42 @@ def make_xlsx(df: pd.DataFrame, trends: pd.DataFrame, sheet_name: str) -> bytes:
             "Avg CTR (%)":      round(df["CTR (%)"].mean(),2)
         }
         header_font = Font(bold=True, color="FFFFFF")
-        header_fill = PatternFill("solid", fgColor="17365D")  # azul escuro :contentReference[oaicite:0]{index=0}
+        header_fill = PatternFill("solid", fgColor="17365D")
         val_font    = Font(bold=True, size=14, color="17365D")
         align_center= Alignment(horizontal="center", vertical="center")
         col = 1
         for title, value in kpis.items():
-            # merge A1:B3, C1:D3, etc.
-            ws_dash.merge_cells(start_row=1, start_column=col, end_row=3, end_column=col+1)
-            cell = ws_dash.cell(row=1, column=col, value=title)
-            cell.font  = header_font
-            cell.fill  = header_fill
-            cell.alignment = align_center
-            cell2 = ws_dash.cell(row=2, column=col, value=value)
-            cell2.font = val_font
-            cell2.alignment = align_center
-            # col += 2 for next card
+            # Title row
+            ws_dash.merge_cells(start_row=1, start_column=col, end_row=1, end_column=col+1)
+            c1 = ws_dash.cell(row=1, column=col, value=title)
+            c1.font = header_font; c1.fill = header_fill; c1.alignment = align_center
+            # Value row
+            ws_dash.merge_cells(start_row=2, start_column=col, end_row=2, end_column=col+1)
+            c2 = ws_dash.cell(row=2, column=col, value=value)
+            c2.font = val_font; c2.alignment = align_center
             col += 2
 
-        # 2) Aba Data
+        # Data sheet
         df.to_excel(writer, sheet_name=sheet_name, index=False, startrow=4)
         ws = writer.sheets[sheet_name]
-        # estilo cabeçalho
+        # Style header
         for idx, col_name in enumerate(df.columns, start=1):
             cell = ws.cell(row=5, column=idx, value=col_name)
             cell.font = header_font
-            cell.fill = PatternFill("solid", fgColor="5B9BD5")  # azul claro :contentReference[oaicite:1]{index=1}
+            cell.fill = PatternFill("solid", fgColor="5B9BD5")
             cell.alignment = align_center
             ws.column_dimensions[get_column_letter(idx)].width = max(len(col_name)+2, 15)
-        # freeze panes e esconder gridlines :contentReference[oaicite:2]{index=2}
         ws.freeze_panes = "A6"
         ws.sheet_view.showGridLines = False
-        # cria tabela Excel
+        # Excel Table
         max_row, max_col = df.shape
-        table = Table(displayName="Table1", ref=f"A5:{get_column_letter(max_col)}{5+max_row}")
+        tab_ref = f"A5:{get_column_letter(max_col)}{5+max_row}"
+        table = Table(displayName="DataTable", ref=tab_ref)
         style = TableStyleInfo(name="TableStyleMedium9", showRowStripes=True)
         table.tableStyleInfo = style
         ws.add_table(table)
 
-        # 3) Aba Trends
+        # Trends sheet
         if trends is not None:
             trends.to_excel(writer, sheet_name="Trends", index=False)
             ws2 = writer.sheets["Trends"]
@@ -244,15 +240,14 @@ def make_xlsx(df: pd.DataFrame, trends: pd.DataFrame, sheet_name: str) -> bytes:
             chart.title = f"{sheet_name} Trends (7d)"
             chart.x_axis.title = "Date"
             chart.y_axis.title = "Count"
-            max_row2, max_col2 = trends.shape
-            data_ref = Reference(ws2, min_col=2, min_row=1, max_col=3, max_row=max_row2+1)
-            cats_ref = Reference(ws2, min_col=1, min_row=2, max_row=max_row2+1)
+            max_r2, max_c2 = trends.shape
+            data_ref = Reference(ws2, min_col=2, min_row=1, max_col=3, max_row=max_r2+1)
+            cats_ref = Reference(ws2, min_col=1, min_row=2, max_row=max_r2+1)
             chart.add_data(data_ref, titles_from_data=True)
             chart.set_categories(cats_ref)
             ws2.add_chart(chart, "E2")
 
-        # salva
-    return bio.getvalue()
+    return buf.getvalue()
 
 # ───────── Endpoints XLSX ─────────
 
