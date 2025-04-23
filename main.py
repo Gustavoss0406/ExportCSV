@@ -223,18 +223,13 @@ def make_xlsx(df: pd.DataFrame, trends: pd.DataFrame, changes: dict) -> bytes:
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         sheet = "Dashboard"
-        df.to_excel(writer, sheet_name=sheet, index=False, startrow=6)
         wb = writer.book
-        ws = writer.sheets[sheet]
-
-        # Cores da marca
-        primary   = "7F56D9"
-        secondary = "E839BC"
-        header_font = Font(bold=True, color="FFFFFF")
-        val_font    = Font(bold=True, size=14, color="FFFFFF")
-        align = Alignment(horizontal="center", vertical="center")
-
-        # 1) KPI section
+        # Criar sheet
+        ws = wb.create_sheet(sheet)
+        # Ajustar colunas
+        for col, width in zip(range(1, 21), [12,12,12,12,12,12,4,4,4,4,4,4,4,4,4,4,4,4,4,4]):
+            ws.column_dimensions[get_column_letter(col)].width = width
+        # KPI boxes
         kpis = {
             "Active Campaigns": len(df),
             "Total Impressions": int(df["Impressions"].sum()),
@@ -242,66 +237,82 @@ def make_xlsx(df: pd.DataFrame, trends: pd.DataFrame, changes: dict) -> bytes:
             "Avg CTR (%)":       round(df["CTR (%)"].mean(),2),
             **changes
         }
+        primary, secondary = "7F56D9", "E839BC"
+        header_font = Font(bold=True, color="FFFFFF")
+        val_font    = Font(bold=True, size=14, color="FFFFFF")
+        align = Alignment(horizontal="center", vertical="center")
+
         col = 1
         for title, value in kpis.items():
-            ws.merge_cells(start_row=1, start_column=col, end_row=1, end_column=col+1)
+            # Box título
+            ws.merge_cells(start_row=1, start_column=col, end_row=1, end_column=col+2)
             c1 = ws.cell(row=1, column=col, value=title)
             c1.font  = header_font; c1.fill = PatternFill("solid", fgColor=primary); c1.alignment = align
-            ws.merge_cells(start_row=2, start_column=col, end_row=2, end_column=col+1)
+            # Box valor
+            ws.merge_cells(start_row=2, start_column=col, end_row=2, end_column=col+2)
             c2 = ws.cell(row=2, column=col, value=value)
             c2.font = val_font; c2.fill = PatternFill("solid", fgColor=secondary); c2.alignment = align
-            col += 2
+            col += 3
 
-        # 2) Tabela de dados
+        # Inserir tabela de dados (em A5:F15 por exemplo)
+        df.to_excel(writer, sheet_name=sheet, index=False, startrow=4, startcol=0)
+        ws.freeze_panes = "A6"
+        # Estilizar header da tabela
         for idx, col_name in enumerate(df.columns, start=1):
-            cell = ws.cell(row=6, column=idx, value=col_name)
+            cell = ws.cell(row=5, column=idx, value=col_name)
             cell.font = header_font
             cell.fill = PatternFill("solid", fgColor=secondary)
             cell.alignment = align
-            ws.column_dimensions[get_column_letter(idx)].width = max(len(col_name)+2, 15)
-        ws.freeze_panes = "A7"
-        ws.sheet_view.showGridLines = False
-        max_row, max_col = df.shape
-        tab_ref = f"A6:{get_column_letter(max_col)}{6+max_row}"
-        table = Table(displayName="DataTable", ref=tab_ref)
-        style = TableStyleInfo(name="TableStyleLight9", showRowStripes=True)
-        table.tableStyleInfo = style
-        ws.add_table(table)
 
-        # 3) Gráficos de tendências
-        if trends is not None and not trends.empty:
-            start_chart_row = 8 + max_row
-            # Escrever dados de trends
-            ws.cell(row=start_chart_row, column=1, value="Date")
-            ws.cell(row=start_chart_row, column=2, value="Impressions")
-            ws.cell(row=start_chart_row, column=3, value="Clicks")
-            ws.cell(row=start_chart_row, column=4, value="CTR (%)")
-            for i, row in trends.iterrows():
-                ws.cell(row=start_chart_row+i+1, column=1, value=row["Date"])
-                ws.cell(row=start_chart_row+i+1, column=2, value=row["Impressions"])
-                ws.cell(row=start_chart_row+i+1, column=3, value=row["Clicks"])
-                ws.cell(row=start_chart_row+i+1, column=4, value=row["CTR (%)"])
-            # Gráfico de Impressions e Clicks
-            chart1 = LineChart()
-            chart1.title = "Impressions & Clicks (últimos 7 dias)"
-            data_ref = Reference(ws, min_col=2, min_row=start_chart_row,
-                                 max_col=3, max_row=start_chart_row+len(trends))
-            cats_ref = Reference(ws, min_col=1, min_row=start_chart_row+1,
-                                 max_row=start_chart_row+len(trends))
-            chart1.add_data(data_ref, titles_from_data=True)
-            chart1.set_categories(cats_ref)
-            chart1.y_axis.title = "Count"
-            ws.add_chart(chart1, f"E{start_chart_row}")
+        # Budget vs Spend chart (barra) à esquerda
+        bar = LineChart()
+        bar.title = "Budget vs Spend por Campanha"
+        # criar dados hipotéticos Budget/Spend extraídos do df
+        # assumindo df contém colunas 'Budget' e 'Spend' caso você já as tenha
+        # ou gere um df auxiliar antes
+        # Aqui ilustrativo: uso Impressões e Cliques para demo
+        data_ref = Reference(ws, min_col=4, min_row=5, max_col=5, max_row=5+len(df))
+        cats_ref = Reference(ws, min_col=2, min_row=6, max_row=5+len(df))
+        bar.add_data(data_ref, titles_from_data=True)
+        bar.set_categories(cats_ref)
+        bar.y_axis.title = "Valor"
+        bar.x_axis.title = "Campanha"
+        bar.style = 2
+        bar.width = 12
+        bar.height = 8
+        bar.anchor = "A20"
+        ws.add_chart(bar)
 
-            # Gráfico de CTR
-            chart2 = LineChart()
-            chart2.title = "CTR (%) (últimos 7 dias)"
-            data_ref2 = Reference(ws, min_col=4, min_row=start_chart_row,
-                                  max_row=start_chart_row+len(trends))
-            chart2.add_data(data_ref2, titles_from_data=True)
-            chart2.set_categories(cats_ref)
-            chart2.y_axis.title = "CTR (%)"
-            ws.add_chart(chart2, f"I{start_chart_row}")
+        # Pequenos charts em grade à direita
+        charts_info = [
+            ("CPA por Campanha",   6, 20, Reference(ws, min_col=6, min_row=5, max_col=6, max_row=5+len(df))),
+            ("CPC por Campanha",   10,20, Reference(ws, min_col=7, min_row=5, max_col=7, max_row=5+len(df))),
+            ("CTR por Campanha",   6, 35, Reference(ws, min_col=8, min_row=5, max_col=8, max_row=5+len(df))),
+            ("Aquisições (%)",     10,35, None)  # abaixo criamos pie chart
+        ]
+        for title, col_pos, row_pos, data in charts_info:
+            if title != "Aquisições (%)":
+                c = LineChart()
+                c.title = title
+                c.add_data(data, titles_from_data=True)
+                c.set_categories(cats_ref)
+                c.style = 12
+                c.width = 6
+                c.height = 6
+                c.anchor = get_column_letter(col_pos) + str(row_pos)
+                ws.add_chart(c)
+            else:
+                # Pie de Aquisições
+                pie = wb.create_chart('pie', title=title)
+                # simular dados
+                labels = [f"Campanha {i+1}" for i in range(len(df))]
+                vals   = list(df["Clicks"])
+                pie.add_data(Reference(ws, min_col=5, min_row=6, max_row=5+len(df)), titles_from_data=True)
+                pie.set_categories(Reference(ws, min_col=2, min_row=6, max_row=5+len(df)))
+                pie.width = 6
+                pie.height = 6
+                pie.anchor = get_column_letter(col_pos) + str(row_pos)
+                ws.add_chart(pie)
 
     return buf.getvalue()
 
