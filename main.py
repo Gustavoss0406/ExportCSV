@@ -66,9 +66,11 @@ async def google_ads_list(refresh_token: str, with_trends: bool = False):
     url   = f"https://googleads.googleapis.com/{API_VERSION}/customers/{cid}/googleAds:search"
     headers = {"Authorization": f"Bearer {token}", "developer-token": DEVELOPER_TOKEN}
 
+    # Métricas adicionais
     q_active = """
         SELECT campaign.id, campaign.name, campaign.status,
-               metrics.impressions, metrics.clicks
+               metrics.impressions, metrics.clicks,
+               metrics.cost_micros, metrics.average_cpc, metrics.ctr, metrics.conversions
         FROM campaign
         WHERE campaign.status = 'ENABLED'
     """
@@ -78,23 +80,34 @@ async def google_ads_list(refresh_token: str, with_trends: bool = False):
             if resp.status != 200:
                 raise HTTPException(resp.status, f"Google search: {text}")
             results = json.loads(text).get("results", [])
-    rows = [{
-        "Campaign ID": r["campaign"]["id"],
-        "Name":        r["campaign"]["name"],
-        "Status":      r["campaign"]["status"],
-        "Impressions": int(r["metrics"]["impressions"]),
-        "Clicks":      int(r["metrics"]["clicks"]),
-        "CTR (%)":     round(int(r["metrics"]["clicks"])/max(int(r["metrics"]["impressions"]),1)*100,2)
-    } for r in results]
+    rows = []
+    for r in results:
+        cost = r["metrics"].get("costMicros", 0) / 1e6
+        clicks = int(r["metrics"].get("clicks", 0))
+        impressions = int(r["metrics"].get("impressions", 0))
+        rows.append({
+            "Campaign ID":      r["campaign"]["id"],
+            "Name":             r["campaign"]["name"],
+            "Status":           r["campaign"]["status"],
+            "Impressions":      impressions,
+            "Clicks":           clicks,
+            "Cost":             round(cost, 2),
+            "Avg CPC":          round(r["metrics"].get("averageCpc", 0)/1e6, 2),
+            "CTR (%)":          round(r["metrics"].get("ctr", 0)*100, 2),
+            "Conversions":      int(r["metrics"].get("conversions", 0)),
+            "Cost/Conv":        round(cost / max(int(r["metrics"].get("conversions", 1)),1), 2)
+        })
     df = pd.DataFrame(rows)
 
     trends = None
+    changes = {"Impressions Change (%)": 0.0, "Clicks Change (%)": 0.0}
     if with_trends:
+        # Puxar 14 dias para calcular semana anterior x atual
         q_trend = """
             SELECT segments.date, metrics.impressions, metrics.clicks
             FROM campaign
-            WHERE campaign.status='ENABLED'
-              AND segments.date DURING LAST_7_DAYS
+            WHERE campaign.status = 'ENABLED'
+              AND segments.date DURING LAST_14_DAYS
         """
         async with aiohttp.ClientSession() as sess:
             async with sess.post(url, headers=headers, json={"query": q_trend}) as resp:
@@ -108,15 +121,28 @@ async def google_ads_list(refresh_token: str, with_trends: bool = False):
             by_date[d]["Impressions"] += int(r["metrics"]["impressions"])
             by_date[d]["Clicks"]      += int(r["metrics"]["clicks"])
         dates = sorted(by_date)
-        trends = pd.DataFrame({
-            "Date":        dates,
-            "Impressions": [by_date[d]["Impressions"] for d in dates],
-            "Clicks":      [by_date[d]["Clicks"] for d in dates],
-        })
+        # Separar últimas 7 datas e as 7 anteriores
+        last7 = dates[-7:]
+        prev7 = dates[-14:-7] if len(dates) >= 14 else dates[:max(len(dates)-7,0)]
+        curr_imp = sum(by_date[d]["Impressions"] for d in last7)
+        prev_imp = sum(by_date[d]["Impressions"] for d in prev7) if prev7 else 0
+        curr_clk = sum(by_date[d]["Clicks"] for d in last7)
+        prev_clk = sum(by_date[d]["Clicks"] for d in prev7) if prev7 else 0
+        changes["Impressions Change (%)"] = round((curr_imp - prev_imp)/max(prev_imp,1)*100,2)
+        changes["Clicks Change (%)"]      = round((curr_clk - prev_clk)/max(prev_clk,1)*100,2)
 
-    return df, trends
+        # DataFrame de tendências de 7 dias + CTR diário
+        trends = pd.DataFrame({
+            "Date":        last7,
+            "Impressions": [by_date[d]["Impressions"] for d in last7],
+            "Clicks":      [by_date[d]["Clicks"] for d in last7]
+        })
+        trends["CTR (%)"] = trends.apply(lambda row: round(row["Clicks"]/max(row["Impressions"],1)*100,2), axis=1)
+
+    return df, trends, changes
 
 async def meta_ads_list(refresh_token: str, account_id: str, with_trends: bool = False):
+    # Campaigns
     url_c = f"https://graph.facebook.com/v16.0/act_{account_id}/campaigns"
     params = {"fields":"id,name,status","access_token": refresh_token}
     async with aiohttp.ClientSession() as sess:
@@ -127,12 +153,14 @@ async def meta_ads_list(refresh_token: str, account_id: str, with_trends: bool =
             data = json.loads(text).get("data", [])
     active = [c for c in data if c["status"]=="ACTIVE"]
 
+    # Insights para 14 dias
+    since_14 = (datetime.now().date() - timedelta(days=14)).isoformat()
+    until    = datetime.now().date().isoformat()
     ins_url = f"https://graph.facebook.com/v16.0/act_{account_id}/insights"
-    since = (datetime.now().date() - timedelta(days=7)).isoformat()
     ins_params = {
         "level":"campaign",
-        "fields":"campaign_id,impressions,clicks,spend,date_start",
-        "time_range": json.dumps({"since":since,"until":since}),
+        "fields":"campaign_id,impressions,clicks,spend,reach,frequency,date_start",
+        "time_range": json.dumps({"since": since_14, "until": until}),
         "access_token": refresh_token
     }
     async with aiohttp.ClientSession() as sess:
@@ -141,85 +169,98 @@ async def meta_ads_list(refresh_token: str, account_id: str, with_trends: bool =
             if resp.status != 200:
                 raise HTTPException(resp.status, f"Meta insights: {text}")
             insights = json.loads(text).get("data", [])
+    # Agrupar por campanha para tabela
     map_ins = {i["campaign_id"]: i for i in insights}
-
     rows = []
     for c in active:
-        m   = map_ins.get(c["id"], {})
+        m = map_ins.get(c["id"], {})
+        spend = float(m.get("spend",0))
+        clicks = int(m.get("clicks",0))
+        impr = int(m.get("impressions",0))
         rows.append({
             "Campaign ID": c["id"],
             "Name":        c["name"],
             "Status":      c["status"],
-            "Impressions": int(m.get("impressions",0)),
-            "Clicks":      int(m.get("clicks",0)),
-            "Spend":       round(float(m.get("spend",0)),2),
-            "CTR (%)":     round(int(m.get("clicks",0))/max(int(m.get("impressions",1)),1)*100,2),
-            "CPC":         round(float(m.get("spend",0))/max(int(m.get("clicks",1)),1),2)
+            "Impressions": impr,
+            "Clicks":      clicks,
+            "Spend":       round(spend,2),
+            "CTR (%)":     round(clicks/max(impr,1)*100,2),
+            "CPC":         round(spend/max(clicks,1),2),
+            "Reach":       int(m.get("reach",0)),
+            "Frequency":   round(float(m.get("frequency",0)),2)
         })
     df = pd.DataFrame(rows)
 
     trends = None
+    changes = {"Impressions Change (%)": 0.0, "Clicks Change (%)": 0.0}
     if with_trends:
+        # Agrupar por dia
         by_date = defaultdict(lambda: {"Impressions":0,"Clicks":0})
         for i in insights:
             dt = i["date_start"]
             by_date[dt]["Impressions"] += int(i.get("impressions",0))
             by_date[dt]["Clicks"]      += int(i.get("clicks",0))
         dates = sorted(by_date)
+        last7 = dates[-7:]
+        prev7 = dates[-14:-7] if len(dates) >= 14 else dates[:max(len(dates)-7,0)]
+        curr_imp = sum(by_date[d]["Impressions"] for d in last7)
+        prev_imp = sum(by_date[d]["Impressions"] for d in prev7) if prev7 else 0
+        curr_clk = sum(by_date[d]["Clicks"] for d in last7)
+        prev_clk = sum(by_date[d]["Clicks"] for d in prev7) if prev7 else 0
+        changes["Impressions Change (%)"] = round((curr_imp - prev_imp)/max(prev_imp,1)*100,2)
+        changes["Clicks Change (%)"]      = round((curr_clk - prev_clk)/max(prev_clk,1)*100,2)
+
         trends = pd.DataFrame({
-            "Date":        dates,
-            "Impressions": [by_date[d]["Impressions"] for d in dates],
-            "Clicks":      [by_date[d]["Clicks"] for d in dates],
+            "Date":        last7,
+            "Impressions": [by_date[d]["Impressions"] for d in last7],
+            "Clicks":      [by_date[d]["Clicks"] for d in last7]
         })
+        trends["CTR (%)"] = trends.apply(lambda row: round(row["Clicks"]/max(row["Impressions"],1)*100,2), axis=1)
 
-    return df, trends
+    return df, trends, changes
 
-def make_xlsx(df: pd.DataFrame, trends: pd.DataFrame) -> bytes:
+def make_xlsx(df: pd.DataFrame, trends: pd.DataFrame, changes: dict) -> bytes:
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        sheet = "Report"
+        sheet = "Dashboard"
         df.to_excel(writer, sheet_name=sheet, index=False, startrow=6)
         wb = writer.book
         ws = writer.sheets[sheet]
 
-        # Colors
-        purple = "6A0DAD"
-        pink   = "D81B60"
+        # Cores da marca
+        primary   = "7F56D9"
+        secondary = "E839BC"
         header_font = Font(bold=True, color="FFFFFF")
         val_font    = Font(bold=True, size=14, color="FFFFFF")
         align = Alignment(horizontal="center", vertical="center")
 
-        # 1) KPI section in same sheet
+        # 1) KPI section
         kpis = {
             "Active Campaigns": len(df),
-            "Impressions":      int(df["Impressions"].sum()),
-            "Clicks":           int(df["Clicks"].sum()),
-            "Avg CTR (%)":      round(df["CTR (%)"].mean(),2)
+            "Total Impressions": int(df["Impressions"].sum()),
+            "Total Clicks":      int(df["Clicks"].sum()),
+            "Avg CTR (%)":       round(df["CTR (%)"].mean(),2),
+            **changes
         }
         col = 1
         for title, value in kpis.items():
-            # Title cell
             ws.merge_cells(start_row=1, start_column=col, end_row=1, end_column=col+1)
             c1 = ws.cell(row=1, column=col, value=title)
-            c1.font  = header_font; c1.fill = PatternFill("solid", fgColor=purple); c1.alignment = align
-            # Value cell
+            c1.font  = header_font; c1.fill = PatternFill("solid", fgColor=primary); c1.alignment = align
             ws.merge_cells(start_row=2, start_column=col, end_row=2, end_column=col+1)
             c2 = ws.cell(row=2, column=col, value=value)
-            c2.font = val_font; c2.fill = PatternFill("solid", fgColor=pink); c2.alignment = align
+            c2.font = val_font; c2.fill = PatternFill("solid", fgColor=secondary); c2.alignment = align
             col += 2
 
-        # 2) Data Table header style
+        # 2) Tabela de dados
         for idx, col_name in enumerate(df.columns, start=1):
             cell = ws.cell(row=6, column=idx, value=col_name)
             cell.font = header_font
-            cell.fill = PatternFill("solid", fgColor=pink)
+            cell.fill = PatternFill("solid", fgColor=secondary)
             cell.alignment = align
             ws.column_dimensions[get_column_letter(idx)].width = max(len(col_name)+2, 15)
-
         ws.freeze_panes = "A7"
         ws.sheet_view.showGridLines = False
-
-        # Excel Table style
         max_row, max_col = df.shape
         tab_ref = f"A6:{get_column_letter(max_col)}{6+max_row}"
         table = Table(displayName="DataTable", ref=tab_ref)
@@ -227,24 +268,40 @@ def make_xlsx(df: pd.DataFrame, trends: pd.DataFrame) -> bytes:
         table.tableStyleInfo = style
         ws.add_table(table)
 
-        # 3) Trends chart below table
-        if trends is not None:
+        # 3) Gráficos de tendências
+        if trends is not None and not trends.empty:
             start_chart_row = 8 + max_row
-            for r_idx, date in enumerate(trends["Date"], start=start_chart_row+1):
-                ws.cell(row=r_idx, column=1, value=date)
-                ws.cell(row=r_idx, column=2, value=trends.at[r_idx-start_chart_row-1, "Impressions"])
-                ws.cell(row=r_idx, column=3, value=trends.at[r_idx-start_chart_row-1, "Clicks"])
-            chart = LineChart()
-            chart.title = "Trends (7d)"
-            chart.x_axis.title = "Date"
-            chart.y_axis.title = "Count"
-            data_ref = Reference(ws, min_col=2, min_row=start_chart_row+1,
+            # Escrever dados de trends
+            ws.cell(row=start_chart_row, column=1, value="Date")
+            ws.cell(row=start_chart_row, column=2, value="Impressions")
+            ws.cell(row=start_chart_row, column=3, value="Clicks")
+            ws.cell(row=start_chart_row, column=4, value="CTR (%)")
+            for i, row in trends.iterrows():
+                ws.cell(row=start_chart_row+i+1, column=1, value=row["Date"])
+                ws.cell(row=start_chart_row+i+1, column=2, value=row["Impressions"])
+                ws.cell(row=start_chart_row+i+1, column=3, value=row["Clicks"])
+                ws.cell(row=start_chart_row+i+1, column=4, value=row["CTR (%)"])
+            # Gráfico de Impressions e Clicks
+            chart1 = LineChart()
+            chart1.title = "Impressions & Clicks (últimos 7 dias)"
+            data_ref = Reference(ws, min_col=2, min_row=start_chart_row,
                                  max_col=3, max_row=start_chart_row+len(trends))
             cats_ref = Reference(ws, min_col=1, min_row=start_chart_row+1,
                                  max_row=start_chart_row+len(trends))
-            chart.add_data(data_ref, titles_from_data=True)
-            chart.set_categories(cats_ref)
-            ws.add_chart(chart, f"E{start_chart_row}")
+            chart1.add_data(data_ref, titles_from_data=True)
+            chart1.set_categories(cats_ref)
+            chart1.y_axis.title = "Count"
+            ws.add_chart(chart1, f"E{start_chart_row}")
+
+            # Gráfico de CTR
+            chart2 = LineChart()
+            chart2.title = "CTR (%) (últimos 7 dias)"
+            data_ref2 = Reference(ws, min_col=4, min_row=start_chart_row,
+                                  max_row=start_chart_row+len(trends))
+            chart2.add_data(data_ref2, titles_from_data=True)
+            chart2.set_categories(cats_ref)
+            chart2.y_axis.title = "CTR (%)"
+            ws.add_chart(chart2, f"I{start_chart_row}")
 
     return buf.getvalue()
 
@@ -252,8 +309,8 @@ def make_xlsx(df: pd.DataFrame, trends: pd.DataFrame) -> bytes:
 
 @app.get("/export_google_active_campaigns_csv")
 async def export_google_xlsx(google_refresh_token: str = Query(..., alias="google_refresh_token")):
-    df, trends = await google_ads_list(google_refresh_token, with_trends=True)
-    xlsx = make_xlsx(df, trends)
+    df, trends, changes = await google_ads_list(google_refresh_token, with_trends=True)
+    xlsx = make_xlsx(df, trends, changes)
     return JSONResponse({
         "fileName": "google_active_campaigns.xlsx",
         "mimeType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -265,8 +322,8 @@ async def export_meta_xlsx(
     meta_account_id:   str = Query(..., alias="meta_account_id"),
     meta_access_token: str = Query(..., alias="meta_access_token")
 ):
-    df, trends = await meta_ads_list(meta_access_token, meta_account_id, with_trends=True)
-    xlsx = make_xlsx(df, trends)
+    df, trends, changes = await meta_ads_list(meta_access_token, meta_account_id, with_trends=True)
+    xlsx = make_xlsx(df, trends, changes)
     return JSONResponse({
         "fileName": "meta_active_campaigns.xlsx",
         "mimeType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -279,14 +336,22 @@ async def export_combined_xlsx(
     meta_account_id:     str = Query(..., alias="meta_account_id"),
     meta_access_token:   str = Query(..., alias="meta_access_token")
 ):
-    g_df, g_tr = await google_ads_list(google_refresh_token, with_trends=True)
-    m_df, m_tr = await meta_ads_list(meta_access_token, meta_account_id, with_trends=True)
+    g_df, g_tr, g_ch = await google_ads_list(google_refresh_token, with_trends=True)
+    m_df, m_tr, m_ch = await meta_ads_list(meta_access_token, meta_account_id, with_trends=True)
+    # Combinar tabelas
     df = pd.concat([g_df, m_df], ignore_index=True)
+    # Combinar tendências
     tr = pd.merge(g_tr, m_tr, on="Date", how="outer", suffixes=("_G","_M")).fillna(0)
     tr["Impressions"] = tr["Impressions_G"] + tr["Impressions_M"]
     tr["Clicks"]      = tr["Clicks_G"] + tr["Clicks_M"]
-    trends = tr[["Date","Impressions","Clicks"]]
-    xlsx = make_xlsx(df, trends)
+    tr["CTR (%)"]     = tr.apply(lambda row: round(row["Clicks"]/max(row["Impressions"],1)*100,2), axis=1)
+    trends = tr[["Date","Impressions","Clicks","CTR (%)"]]
+    # Calcular variação combinada
+    combined_changes = {
+        "Impressions Change (%)": round((g_ch["Impressions Change (%)"] + m_ch["Impressions Change (%)"])/2, 2),
+        "Clicks Change (%)":      round((g_ch["Clicks Change (%)"]      + m_ch["Clicks Change (%)"])/2, 2)
+    }
+    xlsx = make_xlsx(df, trends, combined_changes)
     return JSONResponse({
         "fileName": "combined_active_campaigns.xlsx",
         "mimeType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
