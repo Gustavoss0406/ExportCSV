@@ -31,6 +31,7 @@ app.add_middleware(
     allow_methods=["*"], allow_headers=["*"],
 )
 
+
 # ───────── Helpers for API calls ─────────
 
 async def get_access_token(refresh_token: str) -> str:
@@ -46,6 +47,7 @@ async def get_access_token(refresh_token: str) -> str:
         logging.error("Google token refresh failed: %s", e)
         raise HTTPException(401, f"Falha ao renovar token Google: {e}")
 
+
 async def discover_customer_id(token: str) -> str:
     url = f"https://googleads.googleapis.com/{API_VERSION}/customers:listAccessibleCustomers"
     headers = {"Authorization": f"Bearer {token}", "developer-token": DEVELOPER_TOKEN}
@@ -58,6 +60,7 @@ async def discover_customer_id(token: str) -> str:
             if not names:
                 raise HTTPException(502, "Google: sem customers acessíveis")
             return names[0].split("/")[-1]
+
 
 async def google_ads_list(refresh_token: str, with_trends: bool = False):
     token = await get_access_token(refresh_token)
@@ -101,7 +104,7 @@ async def google_ads_list(refresh_token: str, with_trends: bool = False):
         })
     df = pd.DataFrame(rows)
 
-    # Cálculo de variação semanal e tendências de 7 dias (opcional)
+    # Variações e tendências de 7 dias
     trends, changes = None, {}
     if with_trends:
         q2 = """
@@ -115,10 +118,10 @@ async def google_ads_list(refresh_token: str, with_trends: bool = False):
                 text = await resp.text()
                 if resp.status != 200:
                     raise HTTPException(resp.status, f"Google trend: {text}")
-                results2 = json.loads(text).get("results", [])
+                res2 = json.loads(text).get("results", [])
 
         by_date = defaultdict(lambda: {"Impressions":0,"Clicks":0})
-        for r in results2:
+        for r in res2:
             d = r["segments"]["date"]
             by_date[d]["Impressions"] += int(r["metrics"]["impressions"])
             by_date[d]["Clicks"]      += int(r["metrics"]["clicks"])
@@ -141,6 +144,7 @@ async def google_ads_list(refresh_token: str, with_trends: bool = False):
 
     return df, trends, changes
 
+
 async def meta_ads_list(refresh_token: str, account_id: str, with_trends: bool = False):
     url_c = f"https://graph.facebook.com/v16.0/act_{account_id}/campaigns"
     params = {
@@ -155,12 +159,11 @@ async def meta_ads_list(refresh_token: str, account_id: str, with_trends: bool =
             data = json.loads(text).get("data", [])
 
     since_14 = (datetime.now().date() - timedelta(days=14)).isoformat()
-    until    = datetime.now().date().isoformat()
-    ins_url = f"https://graph.facebook.com/v16.0/act_{account_id}/insights"
+    ins_url  = f"https://graph.facebook.com/v16.0/act_{account_id}/insights"
     ins_params = {
         "level":"campaign",
         "fields":"campaign_id,impressions,clicks,spend,actions",
-        "time_range": json.dumps({"since": since_14, "until": until}),
+        "time_range": json.dumps({"since": since_14, "until": datetime.now().date().isoformat()}),
         "access_token": refresh_token
     }
     async with aiohttp.ClientSession() as sess:
@@ -173,13 +176,13 @@ async def meta_ads_list(refresh_token: str, account_id: str, with_trends: bool =
     map_ins = {i["campaign_id"]: i for i in insights}
     rows = []
     for c in data:
-        spent = float(c.get("amount_spent",0))
+        spent = float(c.get("amount_spent", 0))
         raw_budget = c.get("lifetime_budget") or str(int(c.get("daily_budget",0))*30)
         budget = float(raw_budget)/100
         ins = map_ins.get(c["id"], {})
         clicks = int(ins.get("clicks",0))
         impr   = int(ins.get("impressions",0))
-        conv = sum(int(a.get("value",0)) for a in ins.get("actions",[]))
+        conv   = sum(int(a.get("value",0)) for a in ins.get("actions",[]))
         rows.append({
             "Campaign ID": c["id"],
             "Name":        c["name"],
@@ -220,16 +223,17 @@ async def meta_ads_list(refresh_token: str, account_id: str, with_trends: bool =
 
     return df, trends, changes
 
+
 def make_xlsx(df: pd.DataFrame, trends: pd.DataFrame, changes: dict) -> bytes:
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        # 1) Gravar dados na aba oculta
+        # 1) Grava dados brutos na aba oculta “Data”
         df.to_excel(writer, sheet_name="Data", index=False)
         wb = writer.book
         data_ws = wb["Data"]
         data_ws.sheet_state = "hidden"
 
-        # 2) Criar aba Dashboard
+        # 2) Cria aba “Dashboard”
         dash = wb.create_sheet("Dashboard")
         primary, secondary = "7F56D9", "E839BC"
         header_font = Font(bold=True, color="FFFFFF")
@@ -259,53 +263,61 @@ def make_xlsx(df: pd.DataFrame, trends: pd.DataFrame, changes: dict) -> bytes:
             c2.font, c2.fill, c2.alignment = val_font, PatternFill("solid", fgColor=secondary), align
             col += 3
 
-        # ─── Charts ───
+        # número de campanhas
         n = len(df)
-        # referências no sheet "Data"
-        # Name: coluna 2, Budget:3, Spend:4, CPA:10, CPC:8, Conversions:9, CTR:7
-        ref_names = Reference(data_ws, min_col=2, min_row=2, max_row=n+1)
 
-        # Budget vs Spend
+        # referências para todos os charts apontando para “Data”
+        ref_names   = Reference(data_ws, min_col=2, min_row=2, max_row=n+1)  # coluna “Name”
+        ref_budget  = Reference(data_ws, min_col=3, min_row=1, max_row=n+1)  # “Budget”
+        ref_spend   = Reference(data_ws, min_col=4, min_row=1, max_row=n+1)  # “Spend”
+        ref_cpa     = Reference(data_ws, min_col=10, min_row=1, max_row=n+1) # “CPA”
+        ref_cpc     = Reference(data_ws, min_col=8, min_row=1, max_row=n+1)  # “CPC”
+        ref_conv    = Reference(data_ws, min_col=9, min_row=1, max_row=n+1)  # “Conversions”
+        ref_ctr     = Reference(data_ws, min_col=7, min_row=1, max_row=n+1)  # “CTR (%)”
+
+        # ─── Budget vs Spend ───
         chart1 = BarChart()
         chart1.title = "Budget vs Spend per Campaign"
-        chart1.add_data(Reference(data_ws, min_col=3, min_row=1, max_col=4, max_row=n+1), titles_from_data=True)
+        chart1.add_data(ref_budget, titles_from_data=True)
+        chart1.add_data(ref_spend,  titles_from_data=True)
         chart1.set_categories(ref_names)
         chart1.series[0].graphicalProperties.solidFill = primary
         chart1.series[1].graphicalProperties.solidFill = secondary
         dash.add_chart(chart1, "A5")
 
-        # CPA per Campaign
+        # ─── CPA per Campaign ───
         chart2 = BarChart()
         chart2.title = "CPA per Campaign"
-        chart2.add_data(Reference(data_ws, min_col=10, min_row=1, max_row=n+1), titles_from_data=True)
+        chart2.add_data(ref_cpa, titles_from_data=True)
         chart2.set_categories(ref_names)
         chart2.series[0].graphicalProperties.solidFill = primary
-        dash.add_chart(chart2, "K5")
+        dash.add_chart(chart2, "H5")
 
-        # CPC per Campaign
+        # ─── CPC per Campaign ───
         chart3 = BarChart()
         chart3.title = "CPC per Campaign"
-        chart3.add_data(Reference(data_ws, min_col=8, min_row=1, max_row=n+1), titles_from_data=True)
+        chart3.add_data(ref_cpc, titles_from_data=True)
         chart3.set_categories(ref_names)
         chart3.series[0].graphicalProperties.solidFill = primary
-        dash.add_chart(chart3, "A20")
+        dash.add_chart(chart3, "O5")
 
-        # Acquisitions (Pie)
+        # ─── Acquisitions (Pie) ───
         pie = PieChart()
         pie.title = "Acquisitions"
-        pie.add_data(Reference(data_ws, min_col=9, min_row=1, max_row=n+1), titles_from_data=True)
+        pie.add_data(ref_conv, titles_from_data=True)
         pie.set_categories(ref_names)
-        dash.add_chart(pie, "K20")
+        dash.add_chart(pie, "H20")
 
-        # CTR per Campaign (horizontal)
+        # ─── CTR per Campaign ───
         chart4 = BarChart(orientation="bar")
         chart4.title = "CTR per Campaign"
-        chart4.add_data(Reference(data_ws, min_col=7, min_row=1, max_row=n+1), titles_from_data=True)
+        chart4.add_data(ref_ctr, titles_from_data=True)
         chart4.set_categories(ref_names)
         chart4.series[0].graphicalProperties.solidFill = primary
-        dash.add_chart(chart4, "A35")
+        dash.add_chart(chart4, "O20")
 
     return buf.getvalue()
+
 
 # ───────── Endpoints XLSX ─────────
 
@@ -318,6 +330,7 @@ async def export_google_xlsx(google_refresh_token: str = Query(..., alias="googl
         "mimeType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         "bytes": list(xlsx)
     })
+
 
 @app.get("/export_meta_active_campaigns_csv")
 async def export_meta_xlsx(
@@ -332,6 +345,7 @@ async def export_meta_xlsx(
         "bytes": list(xlsx)
     })
 
+
 @app.get("/export_combined_active_campaigns_csv")
 async def export_combined_xlsx(
     google_refresh_token: str = Query(..., alias="google_refresh_token"),
@@ -342,8 +356,8 @@ async def export_combined_xlsx(
     m_df, m_tr, m_ch = await meta_ads_list(meta_access_token, meta_account_id, with_trends=True)
     df = pd.concat([g_df, m_df], ignore_index=True)
     combined_changes = {
-        "Impr Δ (%)": round((g_ch.get("Impr Δ (%)",0)+m_ch.get("Impr Δ (%)",0))/2,2),
-        "Clk Δ (%)":  round((g_ch.get("Clk Δ (%)",0)+m_ch.get("Clk Δ (%)",0))/2,2)
+        "Impr Δ (%)": round((g_ch.get("Impr Δ (%)",0) + m_ch.get("Impr Δ (%)",0))/2, 2),
+        "Clk Δ (%)":  round((g_ch.get("Clk Δ (%)",0) + m_ch.get("Clk Δ (%)",0))/2, 2)
     }
     xlsx = make_xlsx(df, None, combined_changes)
     return JSONResponse({
@@ -351,6 +365,7 @@ async def export_combined_xlsx(
         "mimeType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         "bytes": list(xlsx)
     })
+
 
 if __name__ == "__main__":
     logging.info("Starting export service on port 8080")
